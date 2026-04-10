@@ -1,0 +1,65 @@
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-iam_db}
+      POSTGRES_USER:     ${DB_USER:-iam_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-iam_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-iam_user} -d ${DB_NAME:-iam_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_API_KEY:        ${OPENAI_API_KEY}
+      GEMINI_API_KEY:        ${GEMINI_API_KEY}
+      DB_HOST:               postgres
+      DB_PORT:               5432
+      DB_NAME:               ${DB_NAME:-iam_db}
+      DB_USER:               ${DB_USER:-iam_user}
+      DB_PASSWORD:           ${DB_PASSWORD:-iam_pass}
+      IAM_SERVICE_BASE_URL:  ${IAM_SERVICE_BASE_URL:-http://localhost:8080/api/v1}
+      KEYCLOAK_ENABLED:      ${KEYCLOAK_ENABLED:-false}
+      KEYCLOAK_URL:          ${KEYCLOAK_URL:-}
+      KEYCLOAK_REALM:        ${KEYCLOAK_REALM:-}
+      KEYCLOAK_CLIENT_ID:    ${KEYCLOAK_CLIENT_ID:-idp-agent-ui}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── React frontend (nginx) ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_URL:            ${VITE_API_URL:-http://localhost:8000}
+        VITE_KEYCLOAK_ENABLED:   ${VITE_KEYCLOAK_ENABLED:-false}
+        VITE_KEYCLOAK_URL:       ${VITE_KEYCLOAK_URL:-}
+        VITE_KEYCLOAK_REALM:     ${VITE_KEYCLOAK_REALM:-}
+        VITE_KEYCLOAK_CLIENT:    ${VITE_KEYCLOAK_CLIENT:-idp-agent-ui}
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

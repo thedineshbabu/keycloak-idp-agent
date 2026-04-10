@@ -5,6 +5,7 @@ Supports OpenAI and Google Gemini.
 """
 import json
 import os
+import time
 from typing import Optional
 
 import httpx
@@ -16,7 +17,8 @@ from tools import (
     validate_idp_config,
     simulate_auth_flow,
     push_to_iam,
-    generate_idp_config
+    generate_idp_config,
+    log_llm_usage,
 )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -33,44 +35,72 @@ class IDPAgent:
 
     # ── LLM Calls ─────────────────────────────────────────────────────────────
 
-    async def _call_openai(self, messages: list, system: str = AGENT_SYSTEM_PROMPT) -> str:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "gpt-4o",
-                    "messages": [{"role": "system", "content": system}] + messages,
-                    "temperature": 0.2,
-                    "max_tokens": 2000
-                }
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
+    async def _call_openai(self, messages: list, system: str = AGENT_SYSTEM_PROMPT,
+                           operation: str = "unknown") -> str:
+        start = time.time()
+        prompt_tokens = completion_tokens = 0
+        success = False
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [{"role": "system", "content": system}] + messages,
+                        "temperature": 0.2,
+                        "max_tokens": 2000
+                    }
+                )
+                response.raise_for_status()
+                data = response.json()
+                usage = data.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                success = True
+                return data["choices"][0]["message"]["content"]
+        finally:
+            duration_ms = int((time.time() - start) * 1000)
+            log_llm_usage(operation, "openai", "gpt-4o", prompt_tokens, completion_tokens,
+                          duration_ms, success)
 
-    async def _call_gemini(self, messages: list, system: str = AGENT_SYSTEM_PROMPT) -> str:
-        # Build Gemini content format
-        contents = []
-        for m in messages:
-            role = "user" if m["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+    async def _call_gemini(self, messages: list, system: str = AGENT_SYSTEM_PROMPT,
+                           operation: str = "unknown") -> str:
+        start = time.time()
+        prompt_tokens = completion_tokens = 0
+        success = False
+        try:
+            contents = []
+            for m in messages:
+                role = "user" if m["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": m["content"]}]})
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}",
-                json={
-                    "system_instruction": {"parts": [{"text": system}]},
-                    "contents": contents,
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2000}
-                }
-            )
-            response.raise_for_status()
-            return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}",
+                    json={
+                        "system_instruction": {"parts": [{"text": system}]},
+                        "contents": contents,
+                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2000}
+                    }
+                )
+                response.raise_for_status()
+                data = response.json()
+                usage_meta = data.get("usageMetadata", {})
+                prompt_tokens = usage_meta.get("promptTokenCount", 0)
+                completion_tokens = usage_meta.get("candidatesTokenCount", 0)
+                success = True
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+        finally:
+            duration_ms = int((time.time() - start) * 1000)
+            log_llm_usage(operation, "gemini", "gemini-1.5-pro", prompt_tokens, completion_tokens,
+                          duration_ms, success)
 
-    async def _llm(self, messages: list, provider: str = "openai", system: str = AGENT_SYSTEM_PROMPT) -> str:
+    async def _llm(self, messages: list, provider: str = "openai",
+                   system: str = AGENT_SYSTEM_PROMPT, operation: str = "unknown") -> str:
         if provider == "gemini":
-            return await self._call_gemini(messages, system)
-        return await self._call_openai(messages, system)
+            return await self._call_gemini(messages, system, operation)
+        return await self._call_openai(messages, system, operation)
 
     # ── Missing field detection ────────────────────────────────────────────────
 
@@ -102,7 +132,8 @@ Ask the user clearly and specifically for each missing field. Be concise and hel
 
             clarification = await self._llm(
                 [{"role": "user", "content": prompt}],
-                provider=llm_provider
+                provider=llm_provider,
+                operation="onboard_idp",
             )
             return {
                 "status": "needs_input",
@@ -134,7 +165,8 @@ Respond with JSON only:
 
         review_raw = await self._llm(
             [{"role": "user", "content": review_prompt}],
-            provider=llm_provider
+            provider=llm_provider,
+            operation="onboard_idp",
         )
         try:
             review = json.loads(review_raw.strip().replace("```json", "").replace("```", ""))
@@ -218,5 +250,5 @@ Respond with JSON only:
             {"role": "user", "content": f"Context:\n{context_str}\n\nUser message: {message}"}
         ]
 
-        reply = await self._llm(messages, provider=llm_provider)
+        reply = await self._llm(messages, provider=llm_provider, operation="chat")
         return {"reply": reply}

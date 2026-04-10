@@ -5,7 +5,7 @@ Functions the agent can call to interact with PostgreSQL, IAM service, and simul
 import re
 import json
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 import httpx
 import psycopg2
@@ -13,16 +13,18 @@ from psycopg2.extras import RealDictCursor
 
 from skill import VALIDATION_RULES
 
-# ── Config (replace with env vars in production) ─────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+import os
+
 DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "database": "iam_db",
-    "user": "iam_user",
-    "password": "iam_pass"
+    "host":     os.getenv("DB_HOST",     "localhost"),
+    "port":     int(os.getenv("DB_PORT", "5432")),
+    "database": os.getenv("DB_NAME",     "iam_db"),
+    "user":     os.getenv("DB_USER",     "iam_user"),
+    "password": os.getenv("DB_PASSWORD", "iam_pass"),
 }
 
-IAM_SERVICE_BASE_URL = "http://localhost:8080/api/v1"
+IAM_SERVICE_BASE_URL = os.getenv("IAM_SERVICE_BASE_URL", "http://localhost:8080/api/v1")
 
 
 # ── Database helpers ──────────────────────────────────────────────────────────
@@ -336,3 +338,231 @@ def _mock_iam_push(config: dict, operation: str) -> dict:
             "email_domain": config.get("email_domain")
         }
     }
+
+
+# ── LLM Usage Logging (Item 1) ────────────────────────────────────────────────
+
+def log_llm_usage(operation: str, provider: str, model: str, prompt_tokens: int,
+                  completion_tokens: int, duration_ms: int, success: bool):
+    """Log a single LLM call's token usage and estimated cost to the DB."""
+    cost_per_1k = {
+        "gpt-4o":          {"prompt": 0.005,   "completion": 0.015},
+        "gemini-1.5-pro":  {"prompt": 0.00125, "completion": 0.005},
+    }
+    rates = cost_per_1k.get(model, {"prompt": 0.005, "completion": 0.015})
+    cost = (prompt_tokens / 1000 * rates["prompt"]) + (completion_tokens / 1000 * rates["completion"])
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO llm_usage_logs
+                (operation, llm_provider, model, prompt_tokens, completion_tokens,
+                 total_tokens, estimated_cost_usd, duration_ms, success)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (operation, provider, model, prompt_tokens, completion_tokens,
+              prompt_tokens + completion_tokens, cost, duration_ms, success))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        pass  # Never let logging failures break the main operation
+
+
+def get_usage_summary() -> dict:
+    """Total tokens and cost by operation for the last 30 days."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT operation,
+                   SUM(total_tokens)        AS tokens,
+                   SUM(estimated_cost_usd)  AS cost,
+                   COUNT(*)                 AS calls
+            FROM llm_usage_logs
+            WHERE created_at >= NOW() - INTERVAL '30 days'
+            GROUP BY operation
+            ORDER BY cost DESC
+        """)
+        by_op = [dict(r) for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT COALESCE(SUM(total_tokens), 0)       AS total_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) AS total_cost
+            FROM llm_usage_logs
+            WHERE created_at >= NOW() - INTERVAL '30 days'
+        """)
+        totals = dict(cur.fetchone())
+        cur.close()
+        conn.close()
+        return {
+            "by_operation": by_op,
+            "total_tokens": int(totals["total_tokens"]),
+            "total_cost_usd": float(totals["total_cost"]),
+        }
+    except Exception:
+        return _mock_usage_summary()
+
+
+def get_usage_by_provider() -> list:
+    """Token and cost breakdown by LLM provider + model."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT llm_provider, model,
+                   SUM(total_tokens)       AS tokens,
+                   SUM(estimated_cost_usd) AS cost,
+                   COUNT(*)                AS calls
+            FROM llm_usage_logs
+            WHERE created_at >= NOW() - INTERVAL '30 days'
+            GROUP BY llm_provider, model
+            ORDER BY cost DESC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return rows
+    except Exception:
+        return _mock_usage_by_provider()
+
+
+def get_usage_timeline() -> list:
+    """Daily token usage over the last 30 days."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DATE(created_at) AS date,
+                   SUM(total_tokens)       AS tokens,
+                   SUM(estimated_cost_usd) AS cost
+            FROM llm_usage_logs
+            WHERE created_at >= NOW() - INTERVAL '30 days'
+            GROUP BY DATE(created_at)
+            ORDER BY date
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return rows
+    except Exception:
+        return _mock_usage_timeline()
+
+
+def get_recent_usage(limit: int = 50) -> list:
+    """Most recent LLM call records."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT operation, llm_provider, model, prompt_tokens, completion_tokens,
+                   total_tokens, estimated_cost_usd, duration_ms, success, created_at
+            FROM llm_usage_logs
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+# ── Certificate Scanning (Item 3) ────────────────────────────────────────────
+
+def parse_certificate_expiry(cert_pem: str) -> dict:
+    """Parse a PEM or raw base64 certificate and return expiry info."""
+    try:
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.backends import default_backend
+
+        if "BEGIN CERTIFICATE" not in cert_pem:
+            cert_pem = f"-----BEGIN CERTIFICATE-----\n{cert_pem}\n-----END CERTIFICATE-----"
+        cert = _x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+        expiry = cert.not_valid_after_utc
+        days_remaining = (expiry - datetime.now(timezone.utc)).days
+        return {
+            "expiry_date": expiry.isoformat(),
+            "days_remaining": days_remaining,
+            "subject": cert.subject.rfc4514_string(),
+            "issuer": cert.issuer.rfc4514_string(),
+            "status": "critical" if days_remaining < 14 else "warning" if days_remaining < 30 else "ok",
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "unknown"}
+
+
+def scan_all_certificates() -> list[dict]:
+    """Scan all IDP configs and return certificate expiry status for each."""
+    idps = fetch_existing_idps()
+    results = []
+    for idp in idps:
+        cert = idp.get("certificate") or idp.get("signing_certificate")
+        if cert:
+            expiry_info = parse_certificate_expiry(cert)
+        else:
+            expiry_info = {"status": "no_cert", "message": "No certificate configured"}
+        results.append({
+            "idp_name": idp["idp_name"],
+            "email_domain": idp["email_domain"],
+            "certificate_status": expiry_info,
+        })
+    return results
+
+
+def log_cert_alerts(expiring: list):
+    """Persist certificate expiry alerts to the cert_alerts table."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        for item in expiring:
+            cs = item["certificate_status"]
+            cur.execute("""
+                INSERT INTO cert_alerts (idp_name, email_domain, days_remaining, expiry_date, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (email_domain) DO UPDATE
+                    SET days_remaining = EXCLUDED.days_remaining,
+                        expiry_date    = EXCLUDED.expiry_date,
+                        created_at     = NOW()
+            """, (item["idp_name"], item["email_domain"],
+                  cs.get("days_remaining"), cs.get("expiry_date")))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+# ── Mock usage data (for prototyping without live DB) ────────────────────────
+
+def _mock_usage_summary() -> dict:
+    return {
+        "by_operation": [
+            {"operation": "onboard_idp", "tokens": 12500, "cost": 0.125,  "calls": 8},
+            {"operation": "chat",        "tokens": 8200,  "cost": 0.062,  "calls": 34},
+            {"operation": "update_idp",  "tokens": 4100,  "cost": 0.041,  "calls": 5},
+        ],
+        "total_tokens": 24800,
+        "total_cost_usd": 0.228,
+    }
+
+
+def _mock_usage_by_provider() -> list:
+    return [
+        {"llm_provider": "openai",  "model": "gpt-4o",         "tokens": 18600, "cost": 0.186, "calls": 32},
+        {"llm_provider": "gemini",  "model": "gemini-1.5-pro",  "tokens": 6200,  "cost": 0.042, "calls": 15},
+    ]
+
+
+def _mock_usage_timeline() -> list:
+    today = datetime.now(timezone.utc).date()
+    return [
+        {"date": str(today - timedelta(days=6)), "tokens": 3200, "cost": 0.032},
+        {"date": str(today - timedelta(days=5)), "tokens": 5600, "cost": 0.056},
+        {"date": str(today - timedelta(days=4)), "tokens": 2100, "cost": 0.021},
+        {"date": str(today - timedelta(days=3)), "tokens": 6800, "cost": 0.068},
+        {"date": str(today - timedelta(days=2)), "tokens": 4200, "cost": 0.042},
+        {"date": str(today - timedelta(days=1)), "tokens": 1900, "cost": 0.019},
+        {"date": str(today),                     "tokens": 1000, "cost": 0.010},
+    ]

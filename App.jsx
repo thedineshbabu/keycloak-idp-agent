@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 
-const API = "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 const COLORS = {
   bg: "#0a0e1a",
@@ -233,6 +233,56 @@ const styles = {
     alignItems: "center",
     padding: "12px 0",
     borderBottom: `1px solid ${COLORS.border}`,
+    gap: "16px",
+    fontSize: "12px",
+  },
+  statCard: {
+    backgroundColor: COLORS.surfaceAlt,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: "6px",
+    padding: "16px 20px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px",
+  },
+  statValue: {
+    fontSize: "22px",
+    fontWeight: 700,
+    color: COLORS.accent,
+  },
+  statLabel: {
+    fontSize: "10px",
+    color: COLORS.textMuted,
+    textTransform: "uppercase",
+    letterSpacing: "0.1em",
+  },
+  grid3: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr 1fr",
+    gap: "16px",
+    marginBottom: "20px",
+  },
+  barRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    marginBottom: "8px",
+  },
+  barTrack: {
+    flex: 1,
+    backgroundColor: COLORS.surfaceAlt,
+    borderRadius: "3px",
+    height: "18px",
+    overflow: "hidden",
+  },
+  certRow: {
+    display: "flex",
+    alignItems: "center",
+    padding: "10px 14px",
+    borderLeft: "3px solid",
+    borderRadius: "4px",
+    marginBottom: "8px",
+    backgroundColor: COLORS.surfaceAlt,
     gap: "16px",
     fontSize: "12px",
   },
@@ -538,17 +588,382 @@ function IDPListView() {
   );
 }
 
+// ── Chart helpers ─────────────────────────────────────────────────────────────
+
+function BarChart({ data, valueKey, labelKey }) {
+  if (!data.length) return <div style={{ color: COLORS.textMuted, fontSize: "12px" }}>No data.</div>;
+  const max = Math.max(...data.map((d) => Number(d[valueKey]) || 0)) || 1;
+  return (
+    <div>
+      {data.map((item, i) => (
+        <div key={i} style={styles.barRow}>
+          <div style={{ width: "130px", fontSize: "11px", color: COLORS.textDim, textAlign: "right", flexShrink: 0 }}>
+            {item[labelKey]}
+          </div>
+          <div style={styles.barTrack}>
+            <div style={{
+              width: `${Math.round((Number(item[valueKey]) / max) * 100)}%`,
+              backgroundColor: COLORS.accent,
+              height: "100%",
+              transition: "width 0.4s",
+              minWidth: "2px",
+            }} />
+          </div>
+          <div style={{ width: "70px", fontSize: "11px", color: COLORS.textMuted, textAlign: "right", flexShrink: 0 }}>
+            {Number(item[valueKey]).toLocaleString()}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function LineChart({ data, valueKey, labelKey }) {
+  if (data.length < 2) return <div style={{ color: COLORS.textMuted, fontSize: "12px" }}>Not enough data.</div>;
+  const W = 560; const H = 100; const PAD = 30;
+  const max = Math.max(...data.map((d) => Number(d[valueKey]) || 0)) || 1;
+  const pts = data.map((d, i) => {
+    const x = PAD + (i / (data.length - 1)) * (W - 2 * PAD);
+    const y = H - PAD - (Number(d[valueKey]) / max) * (H - 2 * PAD);
+    return [x, y];
+  });
+  const polyline = pts.map(([x, y]) => `${x},${y}`).join(" ");
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "100px" }}>
+      <polyline points={polyline} fill="none" stroke={COLORS.accent} strokeWidth="1.5" />
+      {pts.map(([x, y], i) => (
+        <g key={i}>
+          <circle cx={x} cy={y} r="3" fill={COLORS.accent} />
+          {i % Math.ceil(data.length / 7) === 0 && (
+            <text x={x} y={H - 4} textAnchor="middle" fontSize="8" fill={COLORS.textMuted}>
+              {String(data[i][labelKey]).slice(5)}
+            </text>
+          )}
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+// ── Usage View (Item 1) ───────────────────────────────────────────────────────
+
+function UsageView() {
+  const [summary, setSummary] = useState(null);
+  const [byProvider, setByProvider] = useState([]);
+  const [timeline, setTimeline] = useState([]);
+  const [recent, setRecent] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [s, p, t, r] = await Promise.all([
+        fetch(`${API}/usage/summary`).then((x) => x.json()),
+        fetch(`${API}/usage/by-provider`).then((x) => x.json()),
+        fetch(`${API}/usage/timeline`).then((x) => x.json()),
+        fetch(`${API}/usage/recent`).then((x) => x.json()),
+      ]);
+      setSummary(s);
+      setByProvider(p);
+      setTimeline(t);
+      setRecent(r);
+    } catch {
+      setSummary({ total_tokens: 0, total_cost_usd: 0, by_operation: [] });
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const topModel = byProvider.reduce((a, b) => (Number(b.tokens) > Number(a.tokens || 0) ? b : a), {});
+
+  return (
+    <div>
+      {loading && <div style={{ color: COLORS.textMuted, fontSize: "12px" }}>Loading...</div>}
+      {!loading && summary && (
+        <>
+          {/* Summary cards */}
+          <div style={styles.grid3}>
+            <div style={styles.statCard}>
+              <div style={styles.statValue}>{Number(summary.total_tokens).toLocaleString()}</div>
+              <div style={styles.statLabel}>Total Tokens (30d)</div>
+            </div>
+            <div style={styles.statCard}>
+              <div style={styles.statValue}>${Number(summary.total_cost_usd).toFixed(4)}</div>
+              <div style={styles.statLabel}>Estimated Cost (30d)</div>
+            </div>
+            <div style={styles.statCard}>
+              <div style={styles.statValue} style={{ fontSize: "14px", ...styles.statValue }}>{topModel.model || "—"}</div>
+              <div style={styles.statLabel}>Most Used Model</div>
+            </div>
+          </div>
+
+          {/* Bar chart — tokens per operation */}
+          <div style={styles.card}>
+            <div style={styles.cardTitle}>◈ Tokens by Operation</div>
+            <BarChart data={summary.by_operation} valueKey="tokens" labelKey="operation" />
+          </div>
+
+          {/* Line chart — daily usage */}
+          <div style={styles.card}>
+            <div style={styles.cardTitle}>◈ Daily Token Usage (last 30 days)</div>
+            <LineChart data={timeline} valueKey="tokens" labelKey="date" />
+          </div>
+
+          {/* Provider breakdown */}
+          {byProvider.length > 0 && (
+            <div style={styles.card}>
+              <div style={styles.cardTitle}>◈ Provider Breakdown</div>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "11px" }}>
+                <thead>
+                  <tr style={{ color: COLORS.textMuted, textAlign: "left" }}>
+                    {["Provider", "Model", "Calls", "Tokens", "Cost"].map((h) => (
+                      <th key={h} style={{ padding: "6px 12px 6px 0", borderBottom: `1px solid ${COLORS.border}`, textTransform: "uppercase", letterSpacing: "0.07em" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {byProvider.map((r, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${COLORS.border}` }}>
+                      <td style={{ padding: "8px 12px 8px 0", color: COLORS.text }}>{r.llm_provider}</td>
+                      <td style={{ padding: "8px 12px 8px 0", color: COLORS.textDim }}>{r.model}</td>
+                      <td style={{ padding: "8px 12px 8px 0", color: COLORS.textMuted }}>{r.calls}</td>
+                      <td style={{ padding: "8px 12px 8px 0", color: COLORS.textMuted }}>{Number(r.tokens).toLocaleString()}</td>
+                      <td style={{ padding: "8px 0", color: COLORS.accent }}>${Number(r.cost).toFixed(4)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Recent calls table */}
+          {recent.length > 0 && (
+            <div style={styles.card}>
+              <div style={styles.cardTitle}>◈ Recent LLM Calls</div>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "11px" }}>
+                <thead>
+                  <tr style={{ color: COLORS.textMuted, textAlign: "left" }}>
+                    {["Operation", "Model", "Tokens", "Cost", "Duration", "Status", "Time"].map((h) => (
+                      <th key={h} style={{ padding: "6px 12px 6px 0", borderBottom: `1px solid ${COLORS.border}`, textTransform: "uppercase", letterSpacing: "0.07em" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {recent.map((r, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${COLORS.border}` }}>
+                      <td style={{ padding: "7px 12px 7px 0", color: COLORS.text }}>{r.operation}</td>
+                      <td style={{ padding: "7px 12px 7px 0", color: COLORS.textDim }}>{r.model}</td>
+                      <td style={{ padding: "7px 12px 7px 0", color: COLORS.textMuted }}>{r.total_tokens}</td>
+                      <td style={{ padding: "7px 12px 7px 0", color: COLORS.accent }}>${Number(r.estimated_cost_usd).toFixed(5)}</td>
+                      <td style={{ padding: "7px 12px 7px 0", color: COLORS.textMuted }}>{r.duration_ms}ms</td>
+                      <td style={{ padding: "7px 12px 7px 0" }}>
+                        <span style={styles.tag(r.success ? COLORS.success : COLORS.error)}>
+                          {r.success ? "ok" : "fail"}
+                        </span>
+                      </td>
+                      <td style={{ padding: "7px 0", color: COLORS.textMuted }}>{r.created_at ? new Date(r.created_at).toLocaleString() : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Certificate View (Item 3) ─────────────────────────────────────────────────
+
+function CertificatesView() {
+  const [certs, setCerts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [rotating, setRotating] = useState(false);
+  const [rotateDomain, setRotateDomain] = useState("");
+  const [newCert, setNewCert] = useState("");
+  const [rotateResult, setRotateResult] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await fetch(`${API}/certificates/scan`).then((x) => x.json());
+      setCerts(data);
+    } catch {
+      setCerts([]);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const statusColor = (s) =>
+    s === "critical" ? COLORS.error :
+    s === "warning"  ? COLORS.warning :
+    s === "ok"       ? COLORS.success : COLORS.textMuted;
+
+  const critical = certs.filter((c) => c.certificate_status?.status === "critical");
+
+  const submitRotate = async () => {
+    if (!rotateDomain || !newCert) return;
+    setRotating(true);
+    setRotateResult(null);
+    try {
+      const res = await fetch(`${API}/certificates/rotate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email_domain: rotateDomain, new_certificate: newCert }),
+      });
+      const data = await res.json();
+      setRotateResult(data);
+      if (data.status === "success") load();
+    } catch (e) {
+      setRotateResult({ status: "error", message: String(e) });
+    }
+    setRotating(false);
+  };
+
+  return (
+    <div>
+      {/* Critical alert banner */}
+      {critical.length > 0 && (
+        <div style={{ backgroundColor: COLORS.error + "18", border: `1px solid ${COLORS.error}44`, borderRadius: "6px", padding: "12px 16px", marginBottom: "20px", fontSize: "12px", color: COLORS.error }}>
+          ⚠ {critical.length} certificate{critical.length > 1 ? "s" : ""} expiring within 14 days:{" "}
+          {critical.map((c) => c.idp_name).join(", ")}
+        </div>
+      )}
+
+      {/* Certificate health grid */}
+      <div style={styles.card}>
+        <div style={{ ...styles.cardTitle, display: "flex", justifyContent: "space-between" }}>
+          <span>◈ Certificate Health</span>
+          <button style={styles.btn("secondary")} onClick={load} disabled={loading}>
+            {loading ? "⟳" : "Refresh"}
+          </button>
+        </div>
+        {loading && <div style={{ color: COLORS.textMuted, fontSize: "12px" }}>Scanning...</div>}
+        {!loading && certs.length === 0 && (
+          <div style={{ color: COLORS.textMuted, fontSize: "12px" }}>No IDPs found.</div>
+        )}
+        {certs.map((c, i) => {
+          const cs = c.certificate_status;
+          const color = statusColor(cs.status);
+          return (
+            <div key={i} style={{ ...styles.certRow, borderLeftColor: color }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, color: COLORS.text }}>{c.idp_name}</div>
+                <div style={{ color: COLORS.textMuted, fontSize: "11px" }}>{c.email_domain}</div>
+              </div>
+              <div style={{ textAlign: "right", minWidth: "120px" }}>
+                {cs.days_remaining != null ? (
+                  <>
+                    <div style={{ color, fontWeight: 700 }}>{cs.days_remaining}d remaining</div>
+                    <div style={{ color: COLORS.textMuted, fontSize: "10px" }}>{cs.expiry_date?.slice(0, 10)}</div>
+                  </>
+                ) : (
+                  <div style={{ color: COLORS.textMuted, fontSize: "11px" }}>{cs.message || cs.error || cs.status}</div>
+                )}
+              </div>
+              <span style={styles.tag(color)}>{cs.status}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Rotate Certificate panel */}
+      <div style={styles.card}>
+        <div style={styles.cardTitle}>◈ Rotate Certificate</div>
+        <div style={{ ...styles.grid2, marginBottom: "16px" }}>
+          <div style={styles.fieldGroup}>
+            <label style={styles.label}>Email Domain</label>
+            <input style={styles.input} placeholder="acmecorp.com" value={rotateDomain}
+              onChange={(e) => setRotateDomain(e.target.value)} />
+          </div>
+        </div>
+        <div style={styles.fieldGroup}>
+          <label style={styles.label}>New Certificate (PEM or base64)</label>
+          <textarea style={styles.textarea} rows={5}
+            placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+            value={newCert} onChange={(e) => setNewCert(e.target.value)} />
+        </div>
+        <div style={{ marginTop: "16px" }}>
+          <button style={styles.btn("primary")} onClick={submitRotate}
+            disabled={rotating || !rotateDomain || !newCert}>
+            {rotating ? "⟳ Rotating..." : "▶ Rotate Certificate"}
+          </button>
+        </div>
+        {rotateResult && (
+          <div style={{ marginTop: "16px", padding: "12px", borderRadius: "4px",
+            backgroundColor: COLORS.surfaceAlt, fontSize: "11px",
+            color: rotateResult.status === "success" ? COLORS.success : COLORS.error }}>
+            {rotateResult.status === "success"
+              ? `✓ Certificate rotated for ${rotateDomain}`
+              : `✗ ${rotateResult.message || rotateResult.status}`}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
+
+// ── Keycloak integration (Item 2) — optional, requires keycloak-js ───────────
+// To activate: npm install keycloak-js and set VITE_KEYCLOAK_ENABLED=true
+const KEYCLOAK_ENABLED = (typeof import.meta !== "undefined" &&
+  import.meta.env?.VITE_KEYCLOAK_ENABLED === "true");
+
+function useKeycloak() {
+  const [user, setUser] = useState(null);
+  const [kcReady, setKcReady] = useState(!KEYCLOAK_ENABLED);
+
+  useEffect(() => {
+    if (!KEYCLOAK_ENABLED) return;
+    import("./keycloak.js").then(({ default: kc }) => {
+      kc.init({ onLoad: "login-required" }).then((authenticated) => {
+        if (authenticated) {
+          setUser({
+            name: kc.tokenParsed?.name || kc.tokenParsed?.preferred_username,
+            email: kc.tokenParsed?.email,
+            roles: [
+              ...(kc.tokenParsed?.realm_access?.roles || []),
+              ...(kc.tokenParsed?.resource_access?.["idp-agent-ui"]?.roles || []),
+            ],
+            logout: () => kc.logout(),
+          });
+        }
+        setKcReady(true);
+      });
+    }).catch(() => setKcReady(true));
+  }, []);
+
+  return { user, kcReady };
+}
 
 export default function App() {
   const [view, setView] = useState("onboard");
   const [llmProvider, setLlmProvider] = useState("openai");
+  const { user, kcReady } = useKeycloak();
+
+  if (!kcReady) {
+    return (
+      <div style={{ ...styles.app, alignItems: "center", justifyContent: "center" }}>
+        <div style={{ color: COLORS.textMuted, fontSize: "12px" }}>Authenticating...</div>
+      </div>
+    );
+  }
+
+  const isAdmin = !KEYCLOAK_ENABLED || user?.roles?.includes("agent-admin");
 
   const navItems = [
-    { id: "idps", label: "All IDPs", section: "Manage" },
-    { id: "onboard", label: "Onboard New IDP", section: "Actions" },
-    { id: "update", label: "Update IDP", section: "Actions" },
-  ];
+    { id: "idps",         label: "All IDPs",       section: "Manage"      },
+    { id: "usage",        label: "Token Usage",     section: "Observe"     },
+    { id: "certificates", label: "Certificates",    section: "Observe"     },
+    { id: "onboard",      label: "Onboard New IDP", section: "Actions", adminOnly: true },
+    { id: "update",       label: "Update IDP",      section: "Actions", adminOnly: true },
+  ].filter((n) => !n.adminOnly || isAdmin);
 
   const sections = [...new Set(navItems.map((n) => n.section))];
 
@@ -559,7 +974,15 @@ export default function App() {
           <div style={styles.headerTitle}>⬡ Keycloak IDP Agent</div>
           <div style={styles.headerSub}>Agentic IDP Onboarding & Management</div>
         </div>
-        <LLMSelector value={llmProvider} onChange={setLlmProvider} />
+        <div style={{ display: "flex", alignItems: "center", gap: "20px" }}>
+          <LLMSelector value={llmProvider} onChange={setLlmProvider} />
+          {user && (
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ fontSize: "11px", color: COLORS.textDim }}>{user.name || user.email}</span>
+              <button style={styles.btn("secondary")} onClick={user.logout}>Logout</button>
+            </div>
+          )}
+        </div>
       </header>
 
       <div style={styles.main}>
@@ -577,9 +1000,11 @@ export default function App() {
         </nav>
 
         <main style={styles.content}>
-          {view === "onboard" && <OnboardView llmProvider={llmProvider} />}
-          {view === "update" && <UpdateView llmProvider={llmProvider} />}
-          {view === "idps" && <IDPListView />}
+          {view === "onboard"      && <OnboardView llmProvider={llmProvider} />}
+          {view === "update"       && <UpdateView llmProvider={llmProvider} />}
+          {view === "idps"         && <IDPListView />}
+          {view === "usage"        && <UsageView />}
+          {view === "certificates" && <CertificatesView />}
         </main>
       </div>
     </div>
