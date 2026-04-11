@@ -1767,6 +1767,269 @@ function LoginPage({ error }) {
   );
 }
 
+// ── Policy Assistant View ─────────────────────────────────────────────────────
+
+const SUGGESTED_QUESTIONS = [
+  "What resources can a client-admin access?",
+  "What roles does super-admin include?",
+  "What redirect URIs are on the main app client?",
+  "Which users are assigned the agent-admin role?",
+  "What policies are blocking access to the reporting resource?",
+  "What's the difference between client-admin and super-admin?",
+];
+
+const CONFIDENCE_COLOR = (C) => ({
+  high:   C.success,
+  medium: C.warning,
+  low:    C.error,
+});
+
+function PolicyAssistantView({ llmProvider }) {
+  const C = useColors();
+  const S = useStyles();
+
+  const [realms, setRealms]         = useState([]);
+  const [realm, setRealm]           = useState("master");
+  const [question, setQuestion]     = useState("");
+  const [history, setHistory]       = useState([]);
+  const [loading, setLoading]       = useState(false);
+  const [realmLoading, setRealmLoading] = useState(true);
+
+  // Load available realms on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await apiFetch("/policy/realms");
+        const data = await res.json();
+        if (data.realms && data.realms.length) {
+          setRealms(data.realms);
+          setRealm(data.realms[0].realm);
+        } else {
+          setRealms([{ realm: "master", displayName: "master" }]);
+        }
+      } catch {
+        setRealms([{ realm: "master", displayName: "master" }]);
+      }
+      setRealmLoading(false);
+    })();
+  }, []);
+
+  const ask = async (q) => {
+    const trimmed = q.trim();
+    if (!trimmed || loading) return;
+    setLoading(true);
+    setQuestion("");
+    try {
+      const res = await apiFetch("/policy/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: trimmed, realm, llm_provider: llmProvider }),
+      });
+      const data = await res.json();
+      setHistory((prev) => [{ ...data, _id: Date.now() }, ...prev]);
+    } catch (err) {
+      setHistory((prev) => [{
+        _id: Date.now(),
+        status: "error",
+        question: trimmed,
+        realm,
+        error: String(err),
+      }, ...prev]);
+    }
+    setLoading(false);
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(question); }
+  };
+
+  return (
+    <div>
+      {/* ── Header card ── */}
+      <div style={S.card}>
+        <div style={S.cardTitle}>◈ Policy Assistant</div>
+        <div style={{ fontSize: "12px", color: C.textMuted, marginBottom: "16px" }}>
+          Ask natural-language questions about Keycloak roles, policies, permissions, and users.
+        </div>
+
+        {/* Realm selector */}
+        <div style={{ display: "flex", gap: "12px", alignItems: "center", marginBottom: "16px" }}>
+          <label style={{ fontSize: "11px", color: C.textMuted, whiteSpace: "nowrap" }}>Realm:</label>
+          {realmLoading ? (
+            <span style={{ fontSize: "11px", color: C.textMuted }}>Loading realms…</span>
+          ) : (
+            <select
+              value={realm}
+              onChange={(e) => setRealm(e.target.value)}
+              style={{
+                background: C.surfaceAlt, color: C.text, border: `1px solid ${C.border}`,
+                borderRadius: "4px", padding: "6px 10px", fontSize: "12px", fontFamily: "inherit",
+              }}
+            >
+              {realms.map((r) => (
+                <option key={r.realm} value={r.realm}>{r.displayName || r.realm}</option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        {/* Question input */}
+        <div style={{ display: "flex", gap: "8px" }}>
+          <textarea
+            rows={2}
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Ask about roles, policies, permissions, or users…"
+            style={{
+              flex: 1, background: C.surfaceAlt, color: C.text,
+              border: `1px solid ${C.border}`, borderRadius: "4px",
+              padding: "10px 12px", fontSize: "12px", fontFamily: "inherit",
+              resize: "vertical",
+            }}
+          />
+          <button
+            onClick={() => ask(question)}
+            disabled={loading || !question.trim()}
+            style={{
+              ...S.btn("primary"),
+              alignSelf: "flex-end",
+              opacity: loading || !question.trim() ? 0.5 : 1,
+            }}
+          >
+            {loading ? "…" : "Ask →"}
+          </button>
+        </div>
+
+        {/* Suggested question chips */}
+        <div style={{ marginTop: "12px", display: "flex", flexWrap: "wrap", gap: "6px" }}>
+          {SUGGESTED_QUESTIONS.map((sq) => (
+            <button
+              key={sq}
+              onClick={() => ask(sq)}
+              disabled={loading}
+              style={{
+                padding: "4px 10px", fontSize: "11px", borderRadius: "12px",
+                border: `1px solid ${C.border}`, background: "transparent",
+                color: C.textDim, cursor: loading ? "not-allowed" : "pointer",
+                fontFamily: "inherit", transition: "all 0.15s",
+                opacity: loading ? 0.5 : 1,
+              }}
+            >
+              {sq}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Answer history (newest at top) ── */}
+      {history.map((entry) => (
+        <div key={entry._id} style={{ ...S.card, marginTop: "12px" }}>
+          {/* Question header */}
+          <div style={{
+            fontSize: "12px", color: C.textMuted, marginBottom: "10px",
+            paddingBottom: "8px", borderBottom: `1px solid ${C.border}`,
+          }}>
+            <span style={{ color: C.accent, marginRight: "6px" }}>Q:</span>
+            {entry.question}
+            <span style={{
+              marginLeft: "10px", fontSize: "10px", color: C.textMuted,
+            }}>— realm: {entry.realm}</span>
+          </div>
+
+          {/* Error state */}
+          {entry.status === "error" && (
+            <div style={{
+              background: C.error + "18", border: `1px solid ${C.error}`,
+              borderRadius: "4px", padding: "10px 14px",
+              color: C.error, fontSize: "12px",
+            }}>
+              {entry.error}
+            </div>
+          )}
+
+          {/* Success state */}
+          {entry.status === "success" && entry.answer && (() => {
+            const ans = entry.answer;
+            const confColor = (CONFIDENCE_COLOR(C))[ans.confidence] || C.textMuted;
+            return (
+              <>
+                {/* Direct answer highlight */}
+                <div style={{
+                  background: C.accent + "18", border: `1px solid ${C.accent}40`,
+                  borderRadius: "4px", padding: "10px 14px", marginBottom: "10px",
+                  fontSize: "13px", lineHeight: "1.6", color: C.text,
+                }}>
+                  {ans.answer}
+                </div>
+
+                {/* Details */}
+                {ans.details && (
+                  <div style={{ fontSize: "12px", color: C.textDim, lineHeight: "1.7", marginBottom: "10px" }}>
+                    {ans.details}
+                  </div>
+                )}
+
+                {/* Sources + confidence row */}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
+                  {(ans.sources || []).map((src, i) => (
+                    <span key={i} style={{
+                      padding: "2px 8px", borderRadius: "10px", fontSize: "10px",
+                      background: C.surfaceAlt, border: `1px solid ${C.border}`, color: C.textDim,
+                    }}>
+                      {src}
+                    </span>
+                  ))}
+                  <span style={{
+                    padding: "2px 8px", borderRadius: "10px", fontSize: "10px",
+                    background: confColor + "22", border: `1px solid ${confColor}`,
+                    color: confColor, fontWeight: 600, textTransform: "uppercase",
+                    letterSpacing: "0.05em",
+                  }}>
+                    {ans.confidence}
+                  </span>
+                </div>
+
+                {/* Missing data hint */}
+                {ans.missing_data && ans.missing_data !== "None" && (
+                  <div style={{
+                    fontSize: "11px", color: C.warning,
+                    marginBottom: "8px", padding: "6px 10px",
+                    background: C.warning + "12", borderRadius: "4px",
+                    border: `1px solid ${C.warning}40`,
+                  }}>
+                    Missing data: {ans.missing_data}
+                  </div>
+                )}
+
+                {/* Token usage footer */}
+                {entry.token_usage && (
+                  <div style={{ fontSize: "10px", color: C.textMuted, borderTop: `1px solid ${C.border}`, paddingTop: "6px", marginTop: "4px" }}>
+                    {entry.token_usage.prompt_tokens ?? 0} prompt + {entry.token_usage.completion_tokens ?? 0} completion
+                    = {entry.token_usage.total_tokens ?? 0} tokens
+                    &nbsp;·&nbsp;
+                    context: {(entry.context_sources || []).join(", ") || "—"}
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      ))}
+
+      {/* Empty state */}
+      {!loading && history.length === 0 && (
+        <div style={{
+          textAlign: "center", color: C.textMuted, fontSize: "12px",
+          marginTop: "32px", lineHeight: "2",
+        }}>
+          No questions asked yet. Try one of the suggestions above.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -1810,12 +2073,13 @@ export default function App() {
   const isAdmin = user?.roles?.includes("agent-admin") ?? true;
 
   const navItems = [
-    { id: "get-idp",      label: "Get IDP by Domain", section: "Manage"  },
-    { id: "my-idp",       label: "Add My IDP",         section: "Manage"  },
-    { id: "usage",        label: "Token Usage",        section: "Observe" },
-    { id: "certificates", label: "Certificates",       section: "Observe" },
-    { id: "onboard",      label: "Onboard New IDP",    section: "Actions", adminOnly: true },
-    { id: "update",       label: "Update IDP",         section: "Actions", adminOnly: true },
+    { id: "get-idp",      label: "Get IDP by Domain", section: "Manage"       },
+    { id: "my-idp",       label: "Add My IDP",         section: "Manage"       },
+    { id: "usage",        label: "Token Usage",        section: "Observe"      },
+    { id: "certificates", label: "Certificates",       section: "Observe"      },
+    { id: "onboard",      label: "Onboard New IDP",    section: "Actions",     adminOnly: true },
+    { id: "update",       label: "Update IDP",         section: "Actions",     adminOnly: true },
+    { id: "policy",       label: "Policy Assistant",   section: "Intelligence" },
   ].filter((n) => !n.adminOnly || isAdmin);
 
   const sections = [...new Set(navItems.map((n) => n.section))];
@@ -1867,6 +2131,7 @@ export default function App() {
             {view === "my-idp"       && <MyIDPView llmProvider={llmProvider} user={user} />}
             {view === "usage"        && <UsageView />}
             {view === "certificates" && <CertificatesView />}
+            {view === "policy"       && <PolicyAssistantView llmProvider={llmProvider} />}
           </main>
         </div>
       </div>
