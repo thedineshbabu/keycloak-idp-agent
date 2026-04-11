@@ -9,6 +9,8 @@ from pydantic import BaseModel
 
 from agent import IDPAgent
 from auth import require_admin, verify_token
+from keycloak_admin import KeycloakAdminClient
+from policy_engine import PolicyQueryEngine
 from tools import (
     core_create_domain_attributes,
     core_get_domain_attributes,
@@ -64,6 +66,8 @@ app.add_middleware(
 )
 
 agent = IDPAgent()
+kc_admin = KeycloakAdminClient()
+policy_engine = PolicyQueryEngine(kc_admin)
 
 
 # ── Request models ────────────────────────────────────────────────────────────
@@ -95,6 +99,12 @@ class ChatRequest(BaseModel):
 class RotateRequest(BaseModel):
     email_domain: str
     new_certificate: str
+    llm_provider: str = "openai"
+
+
+class PolicyQueryRequest(BaseModel):
+    question: str
+    realm: str = "master"
     llm_provider: str = "openai"
 
 
@@ -230,6 +240,44 @@ def cert_schedule_scan(user: dict = Depends(require_admin)):
     if _has_scheduler:
         return {"scheduled": True, "message": "Daily cert scan runs at 08:00 server time."}
     return {"scheduled": False, "message": "apscheduler not installed. Run: pip install apscheduler"}
+
+
+# ── Policy Query Engine endpoints ────────────────────────────────────────────
+
+@app.get("/policy/realms")
+async def get_policy_realms(_: dict = Depends(verify_token)):
+    """List all Keycloak realms visible to the service account."""
+    return await policy_engine.get_available_realms()
+
+
+@app.post("/policy/query")
+async def policy_query(req: PolicyQueryRequest, _: dict = Depends(verify_token)):
+    """Answer a natural-language question about Keycloak roles, policies, and users."""
+    return await policy_engine.query(req.question, req.realm, req.llm_provider)
+
+
+@app.get("/policy/roles/{realm}")
+async def get_policy_roles(realm: str, _: dict = Depends(verify_token)):
+    """Return all realm-level roles for the given realm."""
+    return await kc_admin.get_realm_roles(realm)
+
+
+@app.get("/policy/clients/{realm}")
+async def get_policy_clients(realm: str, _: dict = Depends(verify_token)):
+    """Return all clients for the given realm."""
+    return await kc_admin.get_clients(realm)
+
+
+@app.get("/policy/user/{realm}/{username}")
+async def get_user_policy(realm: str, username: str, _: dict = Depends(verify_token)):
+    """Return roles and groups for the first user matching the given username / email."""
+    users = await kc_admin.search_users(realm, username)
+    if not users:
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found in realm '{realm}'")
+    user = users[0]
+    roles  = await kc_admin.get_user_roles(realm, user["id"])
+    groups = await kc_admin.get_user_groups(realm, user["id"])
+    return {"user": user, "roles": roles, "groups": groups}
 
 
 # ── Core API proxy endpoints (/v2/clients/customAttributes) ──────────────────
