@@ -10,6 +10,9 @@ React UI  →  FastAPI Backend  →  Agent Core  →  Tools
                               OpenAI / Gemini LLM
                                      ↓
                 PostgreSQL  |  Core API (customAttributes)  |  Auth Simulator
+
+                       ↕ (Policy Query Engine)
+                 Keycloak Admin REST API
 ```
 
 ## Features
@@ -25,6 +28,7 @@ React UI  →  FastAPI Backend  →  Agent Core  →  Tools
 - **Token usage dashboard** — Tracks token consumption and estimated cost per operation and model over time
 - **Keycloak SSO login** — JWT-based auth protecting write endpoints; access token is forwarded dynamically to all Core API calls; role-based UI (admin vs viewer)
 - **Certificate rotation** — Scans all IDP certificates for expiry, alerts on certs expiring within 30 days, supports manual rotation from the UI; automated daily scan via APScheduler
+- **Policy Assistant** — Natural-language query engine that answers questions about Keycloak roles, policies, permissions, and users using live data from the Keycloak Admin API; context is built intelligently based on the question and answered by an LLM with cited sources and a confidence rating
 - **Core API proxy** — Direct GET/POST/PUT proxy to the internal Core API (`/v2/clients/customAttributes`) for fine-grained attribute management
 - **Mock mode** — Works without a live DB or IAM service for prototyping
 
@@ -32,14 +36,16 @@ React UI  →  FastAPI Backend  →  Agent Core  →  Tools
 
 ```
 keycloak-idp-agent/
-├── main.py          # FastAPI app + all endpoints
-├── agent.py         # Agent core (LLM orchestration + usage logging)
-├── skill.py         # IDP skill schema + system prompt
-├── tools.py         # Tool functions (DB, Core API, simulator, usage, certificates)
-├── auth.py          # Keycloak JWT validation middleware
-├── keycloak.js      # Frontend Keycloak client config
-├── App.jsx          # React UI (all views)
-└── schema.sql       # PostgreSQL table DDL
+├── main.py              # FastAPI app + all endpoints
+├── agent.py             # Agent core (LLM orchestration + usage logging)
+├── skill.py             # IDP skill schema + system prompt
+├── tools.py             # Tool functions (DB, Core API, simulator, usage, certificates)
+├── auth.py              # Keycloak JWT validation middleware
+├── keycloak_admin.py    # Keycloak Admin API client (service account auth)
+├── policy_engine.py     # LLM-powered policy query engine
+├── keycloak.js          # Frontend Keycloak client config
+├── App.jsx              # React UI (all views)
+└── schema.sql           # PostgreSQL table DDL
 ```
 
 ## Quick Start (Docker)
@@ -179,6 +185,43 @@ VITE_KEYCLOAK_CLIENT=your-client-id
 
 When enabled, the UI shows the logged-in user's name, a logout button, and hides admin-only actions (Onboard, Update IDP) from viewer-role users. The access token obtained at login is attached as a `Bearer` header on every API call and forwarded to the Core API automatically.
 
+### Policy Query Engine — Service Account Setup
+
+The Policy Assistant requires a dedicated Keycloak service account with read access to the Admin REST API.
+
+#### 1. Create the service account client (one-time, in Keycloak Admin Console)
+
+1. Go to your realm → **Clients** → **Create**
+2. Set **Access Type** to `confidential` and enable **Service Accounts**
+3. Under **Service Account Roles**, assign the following roles from the `realm-management` client:
+   - `view-realm`
+   - `view-clients`
+   - `view-users`
+   - `query-users`
+   - `query-clients`
+4. Copy the client ID and secret from the **Credentials** tab
+
+#### 2. Add to `.env`
+
+```bash
+KEYCLOAK_ADMIN_CLIENT_ID=your-service-account-client-id
+KEYCLOAK_ADMIN_CLIENT_SECRET=your-client-secret
+```
+
+The engine authenticates via the `client_credentials` grant and caches the token in memory, refreshing it automatically 30 seconds before expiry.
+
+#### Example questions the engine can answer
+
+| Question | Context fetched |
+|----------|----------------|
+| What can a client-admin access? | realm roles, clients, authz data |
+| What roles does user john@acme.com have? | users (search), user roles, user groups |
+| What redirect URIs are on the talent app? | clients |
+| What's the difference between admin and viewer? | realm roles, role composites |
+| Which clients have authorization services enabled? | clients |
+| What policies block access to the reports resource? | authz data for enabled clients |
+| Which users are in the super-admin role? | realm roles, role membership |
+
 ## API Reference
 
 ### Core
@@ -213,6 +256,49 @@ When enabled, the UI shows the logged-in user's name, a logout button, and hides
 | `POST` | `/certificates/rotate` | admin | Push a new certificate to IAM |
 | `POST` | `/certificates/schedule-scan` | admin | Check daily scan scheduler status |
 
+### Policy Query Engine
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/policy/realms` | any | List all Keycloak realms visible to the service account |
+| `POST` | `/policy/query` | any | Ask a natural-language question about roles, policies, or users |
+| `GET` | `/policy/roles/{realm}` | any | All realm-level roles |
+| `GET` | `/policy/clients/{realm}` | any | All clients in the realm |
+| `GET` | `/policy/user/{realm}/{username}` | any | Roles and groups for a user |
+
+#### `POST /policy/query` — request body
+
+```json
+{
+  "question": "What can a client-admin access?",
+  "realm": "your-realm",
+  "llm_provider": "openai"
+}
+```
+
+#### `POST /policy/query` — response
+
+```json
+{
+  "status": "success",
+  "question": "What can a client-admin access?",
+  "realm": "your-realm",
+  "answer": {
+    "answer": "Direct one-to-three sentence answer.",
+    "details": "Elaboration with specifics from the context.",
+    "sources": ["realm role: client-admin", "client: my-app"],
+    "missing_data": "None",
+    "confidence": "high"
+  },
+  "context_sources": ["realm_roles", "clients", "authz_my-app"],
+  "token_usage": {
+    "prompt_tokens": 800,
+    "completion_tokens": 300,
+    "total_tokens": 1100
+  }
+}
+```
+
 ### Core API Proxy
 
 These endpoints proxy directly to the internal Core API (`/v2/clients/customAttributes`).
@@ -227,17 +313,13 @@ These endpoints proxy directly to the internal Core API (`/v2/clients/customAttr
 
 | Section | Item | Role | Description |
 |---------|------|------|-------------|
-| Manage | Dashboard | any | Token usage dashboard |
-| Manage | List IDPs | any | All registered IDPs |
 | Manage | Get IDP by Domain | any | Look up one IDP; supports email input (domain auto-extracted); inline edit and clone |
-| Actions | Onboard IDP | admin | Full agent-assisted onboard flow |
-| Actions | Add My IDP | any | Self-service onboard — pre-fills domain from logged-in user's email |
+| Manage | Add My IDP | any | Self-service onboard — pre-fills domain from logged-in user's email |
+| Observe | Token Usage | any | Token consumption and cost dashboard |
+| Observe | Certificates | any | Certificate expiry status and rotation |
+| Actions | Onboard New IDP | admin | Full agent-assisted onboard flow |
 | Actions | Update IDP | admin | Fetch and edit an existing IDP |
-| Actions | Chat | any | Conversational agent interface |
-| Certificates | Certificate Status | any | Scan and view expiry status |
-| Certificates | Expiring Soon | any | Certs expiring within 30 days |
-| Certificates | Rotate Certificate | admin | Push a new certificate |
-| Advanced | Core Attributes | any/admin | Direct Core API attribute management |
+| Intelligence | Policy Assistant | any | Natural-language query engine for Keycloak roles, policies, and users |
 
 ### Get IDP by Domain — inline actions
 
@@ -246,6 +328,18 @@ After a successful domain lookup, two actions are available:
 - **✎ Edit** — opens an inline form pre-filled with the current SAML attributes; changes are submitted to `POST /update`
 - **⎘ Clone** — copies all SAML attributes (entity ID, SSO URL, SLO URL, certificate, protocol) into a new onboard form; the email domain field is intentionally left blank so you must supply new domains before submitting to `POST /onboard`
 
+### Policy Assistant — answer card anatomy
+
+Each answer in the history shows:
+
+- **Question** — the question asked, with realm label
+- **Direct answer** — one-to-three sentence highlighted block
+- **Details** — elaboration with specific names and values from context
+- **Source tags** — each Keycloak entity cited (e.g. `realm role: client-admin`, `client: my-app`)
+- **Confidence badge** — `high` / `medium` / `low` based on how well the context covered the question
+- **Missing data** — note on what additional context would improve the answer (shown only when applicable)
+- **Token footer** — prompt + completion token counts and the context keys that were fetched
+
 ## Extending
 
 - Add new required fields in `skill.py` → `IDP_SKILL_SCHEMA`
@@ -253,3 +347,4 @@ After a successful domain lookup, two actions are available:
 - Add more simulation steps in `tools.py` → `simulate_auth_flow()`
 - Extend to support OIDC by adding OIDC-specific tools
 - Add cost rates for new models in `tools.py` → `log_llm_usage()`
+- Add new context sources to `keycloak_admin.py` → `build_context()` for richer policy queries
