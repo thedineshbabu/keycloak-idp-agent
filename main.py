@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +10,10 @@ from pydantic import BaseModel
 from agent import IDPAgent
 from auth import require_admin, verify_token
 from tools import (
+    core_create_domain_attributes,
+    core_get_domain_attributes,
+    core_upsert_domain_attributes,
+    fetch_idp_by_domain,
     get_recent_usage,
     get_usage_by_provider,
     get_usage_summary,
@@ -69,7 +74,7 @@ class OnboardRequest(BaseModel):
     entity_id: Optional[str] = None
     sso_url: Optional[str] = None
     certificate: Optional[str] = None
-    email_domain: Optional[str] = None
+    email_domains: Optional[list] = None   # one or more email domains
     metadata_xml: Optional[str] = None
     extra_attributes: Optional[dict] = None
     llm_provider: str = "openai"
@@ -106,17 +111,42 @@ def list_idps():
     return agent.get_existing_idps()
 
 
+@app.get("/idps/{email_domain}")
+async def get_idp(email_domain: str, user: dict = Depends(verify_token)):
+    """Fetch a single IDP config by email domain (any authenticated user)."""
+    token = user.get("access_token")
+    try:
+        result = await core_get_domain_attributes(email_domain, token)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=exc.response.status_code,
+            detail=f"Core API error: {exc.response.text}",
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Core API unreachable: {exc}")
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No IDP found for domain '{email_domain}'")
+    return result
+
+
 @app.post("/onboard")
 async def onboard_idp(req: OnboardRequest, user: dict = Depends(require_admin)):
     """Onboard a new IDP (admin only)."""
-    result = await agent.onboard_idp(req.dict(), req.llm_provider)
+    result = await agent.onboard_idp(req.dict(), req.llm_provider, token=user.get("access_token"))
+    return result
+
+
+@app.post("/onboard-user")
+async def onboard_idp_self(req: OnboardRequest, user: dict = Depends(verify_token)):
+    """Self-service onboard — any authenticated user can register an IDP for their own email domain."""
+    result = await agent.onboard_idp(req.dict(), req.llm_provider, token=user.get("access_token"))
     return result
 
 
 @app.post("/update")
 async def update_idp(req: UpdateRequest, user: dict = Depends(require_admin)):
     """Update an existing IDP (admin only)."""
-    result = await agent.update_idp(req.email_domain, req.updates, req.llm_provider)
+    result = await agent.update_idp(req.email_domain, req.updates, req.llm_provider, token=user.get("access_token"))
     return result
 
 
@@ -189,6 +219,7 @@ async def cert_rotate(req: RotateRequest, user: dict = Depends(require_admin)):
         req.email_domain,
         {"certificate": req.new_certificate},
         req.llm_provider,
+        token=user.get("access_token"),
     )
     return result
 
@@ -199,6 +230,64 @@ def cert_schedule_scan(user: dict = Depends(require_admin)):
     if _has_scheduler:
         return {"scheduled": True, "message": "Daily cert scan runs at 08:00 server time."}
     return {"scheduled": False, "message": "apscheduler not installed. Run: pip install apscheduler"}
+
+
+# ── Core API proxy endpoints (/v2/clients/customAttributes) ──────────────────
+
+class CoreAttributesBody(BaseModel):
+    entityId: Optional[str] = None
+    assertionConsumerServiceUrl: Optional[str] = None
+    singleLogoutServiceUrl: Optional[str] = None
+    singleSignOnServiceUrl: Optional[str] = None
+    idpEntityId: Optional[str] = None
+    idpX509Cert: Optional[str] = None
+    spX509Cert: Optional[str] = None
+    privateKey: Optional[str] = None
+    validateSignature: Optional[bool] = None
+    authnRequestsSigned: Optional[bool] = None
+    assertionSigned: Optional[bool] = None
+    assertionEncrypted: Optional[bool] = None
+
+
+@app.get("/core/customAttributes")
+async def get_domain_attributes(domainUrl: str, user: dict = Depends(verify_token)):
+    """GET SSO attributes for a domain from the Core API."""
+    result = await core_get_domain_attributes(domainUrl, user.get("access_token"))
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Domain '{domainUrl}' not found in Core API")
+    return result
+
+
+@app.post("/core/customAttributes")
+async def create_domain_attributes(
+    domainUrl: str,
+    body: CoreAttributesBody,
+    user: dict = Depends(require_admin),
+):
+    """POST — create new SSO attributes for a domain in the Core API (fails on 409 if already exists)."""
+    result = await core_create_domain_attributes(domainUrl, body.dict(exclude_none=True), user.get("access_token"))
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("error", "Core API error"),
+        )
+    return result
+
+
+@app.put("/core/customAttributes")
+async def upsert_domain_attributes(
+    domainUrl: str,
+    body: CoreAttributesBody,
+    user: dict = Depends(require_admin),
+):
+    """PUT — upsert SSO attributes for a domain in the Core API (create or update)."""
+    result = await core_upsert_domain_attributes(domainUrl, body.dict(exclude_none=True), user.get("access_token"))
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("error", "Core API error"),
+        )
+    return result
 
 
 if __name__ == "__main__":

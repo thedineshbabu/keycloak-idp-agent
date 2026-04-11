@@ -115,7 +115,7 @@ class IDPAgent:
 
     # ── Onboard new IDP ───────────────────────────────────────────────────────
 
-    async def onboard_idp(self, inputs: dict, llm_provider: str = "openai") -> dict:
+    async def onboard_idp(self, inputs: dict, llm_provider: str = "openai", token: Optional[str] = None) -> dict:
         protocol = inputs.get("protocol", "saml")
 
         # Step 1: Check for missing fields
@@ -195,7 +195,7 @@ Respond with JSON only:
             }
 
         # Step 7: Push to IAM
-        push_result = await push_to_iam(config, operation="create")
+        push_result = await push_to_iam(config, operation="create", token=token)
 
         return {
             "status": "success" if push_result["success"] else "push_failed",
@@ -208,9 +208,9 @@ Respond with JSON only:
 
     # ── Update existing IDP ───────────────────────────────────────────────────
 
-    async def update_idp(self, email_domain: str, updates: dict, llm_provider: str = "openai") -> dict:
+    async def update_idp(self, email_domain: str, updates: dict, llm_provider: str = "openai", token: Optional[str] = None) -> dict:
         # Step 1: Fetch existing config
-        existing_config = fetch_idp_by_domain(email_domain)
+        existing_config = fetch_idp_by_domain(email_domain, token)
         if not existing_config:
             return {"status": "not_found", "message": f"No IDP found for domain '{email_domain}'"}
 
@@ -229,7 +229,7 @@ Respond with JSON only:
             }
 
         # Step 4: Push to IAM
-        push_result = await push_to_iam(updated_config, operation="update")
+        push_result = await push_to_iam(updated_config, operation="update", token=token)
 
         return {
             "status": "success" if push_result["success"] else "push_failed",

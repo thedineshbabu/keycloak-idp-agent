@@ -9,19 +9,23 @@ React UI  →  FastAPI Backend  →  Agent Core  →  Tools
                                      ↓
                               OpenAI / Gemini LLM
                                      ↓
-                         PostgreSQL  |  IAM Service API  |  Auth Simulator
+                PostgreSQL  |  Core API (customAttributes)  |  Auth Simulator
 ```
 
 ## Features
 
 - **Onboard new IDPs** — Agent validates inputs against the IDP skill schema, fetches existing patterns from your DB, generates a complete config, simulates the auth flow, and pushes to your IAM service
+- **Self-service onboard** — Any authenticated user can register an IDP for their own email domain via `/onboard-user`; their email domain is pre-filled in the UI
 - **Update existing IDPs** — Fetch current config by email domain, apply changes (certificate rotation, URL updates, etc.), validate, and push
+- **Get IDP by Domain** — Look up any IDP by email domain or full email address (domain is extracted automatically); results can be edited or cloned inline
+- **Clone IDP config** — Copy all SAML attributes from an existing IDP into a new onboard form; domain is intentionally left blank so you supply new domains
 - **Smart validation** — Asks for missing required fields before proceeding
 - **Auth flow simulation** — Validates routing, attribute mapping, certificate format, SSO URL reachability, and JWT enrichment
 - **LLM-powered review** — Uses OpenAI or Gemini to review configs against your existing patterns
 - **Token usage dashboard** — Tracks token consumption and estimated cost per operation and model over time
-- **Keycloak SSO login** — Optional JWT-based auth protecting write endpoints; role-based UI (admin vs viewer)
+- **Keycloak SSO login** — JWT-based auth protecting write endpoints; access token is forwarded dynamically to all Core API calls; role-based UI (admin vs viewer)
 - **Certificate rotation** — Scans all IDP certificates for expiry, alerts on certs expiring within 30 days, supports manual rotation from the UI; automated daily scan via APScheduler
+- **Core API proxy** — Direct GET/POST/PUT proxy to the internal Core API (`/v2/clients/customAttributes`) for fine-grained attribute management
 - **Mock mode** — Works without a live DB or IAM service for prototyping
 
 ## Project Structure
@@ -31,7 +35,7 @@ keycloak-idp-agent/
 ├── main.py          # FastAPI app + all endpoints
 ├── agent.py         # Agent core (LLM orchestration + usage logging)
 ├── skill.py         # IDP skill schema + system prompt
-├── tools.py         # Tool functions (DB, IAM, simulator, usage, certificates)
+├── tools.py         # Tool functions (DB, Core API, simulator, usage, certificates)
 ├── auth.py          # Keycloak JWT validation middleware
 ├── keycloak.js      # Frontend Keycloak client config
 ├── App.jsx          # React UI (all views)
@@ -116,22 +120,42 @@ The IAM service should expose:
 - `POST /api/v1/idp/configurations` — create new IDP
 - `PUT /api/v1/idp/configurations/{email_domain}` — update IDP
 
-### Keycloak SSO (optional)
+### Core API (`tools.py`)
+
+The agent integrates with an internal Core API for SSO attribute management:
+
+```bash
+export CORE_API_BASE_URL=https://your-core-api-host
+export CORE_API_BEARER_TOKEN=<service-account-token>   # fallback for scheduled jobs
+```
+
+`CORE_API_BEARER_TOKEN` is only used as a fallback (e.g., the automated daily certificate scan). For all user-initiated requests, the logged-in user's Keycloak access token is forwarded dynamically instead.
+
+The Core API is expected to expose:
+- `GET /v2/clients/customAttributes?domainUrl=<domain>` — fetch SSO attributes
+- `POST /v2/clients/customAttributes?domainUrl=<domain>` — create SSO attributes (409 if already exists)
+- `PUT /v2/clients/customAttributes?domainUrl=<domain>` — upsert SSO attributes
+
+> **Note:** If the Core API uses an internal CA or self-signed certificate, SSL verification is disabled (`verify=False`) for all Core API calls.
+
+### Keycloak SSO
 
 Set environment variables to enable token enforcement:
 
 ```bash
 export KEYCLOAK_ENABLED=true
-export KEYCLOAK_URL=https://your-keycloak-server/auth
+export KEYCLOAK_URL=https://your-keycloak-server
 export KEYCLOAK_REALM=your-realm
-export KEYCLOAK_CLIENT_ID=idp-agent-ui
+export KEYCLOAK_CLIENT_ID=your-client-id
 ```
 
 When `KEYCLOAK_ENABLED` is `false` (the default), every request gets a synthetic `agent-admin` context so local development works without a Keycloak instance.
 
+JWT validation uses the Keycloak JWKS endpoint (`/realms/{realm}/protocol/openid-connect/certs`) and enforces the `iss` claim. Audience (`aud`) enforcement is intentionally disabled to handle tokens where `aud=["account"]` rather than the client ID — the issuer check is the primary security boundary.
+
 #### Keycloak client setup (one-time)
 
-1. Create a client `idp-agent-ui` in your realm
+1. Create a client in your realm
    - Protocol: `openid-connect`, Access Type: `public`
    - Valid Redirect URIs: `http://localhost:5173/*`
    - Web Origins: `http://localhost:5173`
@@ -148,12 +172,12 @@ Add to your `.env`:
 
 ```
 VITE_KEYCLOAK_ENABLED=true
-VITE_KEYCLOAK_URL=https://your-keycloak-server/auth
+VITE_KEYCLOAK_URL=https://your-keycloak-server
 VITE_KEYCLOAK_REALM=your-realm
-VITE_KEYCLOAK_CLIENT=idp-agent-ui
+VITE_KEYCLOAK_CLIENT=your-client-id
 ```
 
-When enabled, the UI shows the logged-in user's name, a logout button, and hides admin actions (Onboard, Update IDP) from viewer-role users.
+When enabled, the UI shows the logged-in user's name, a logout button, and hides admin-only actions (Onboard, Update IDP) from viewer-role users. The access token obtained at login is attached as a `Bearer` header on every API call and forwarded to the Core API automatically.
 
 ## API Reference
 
@@ -163,22 +187,24 @@ When enabled, the UI shows the logged-in user's name, a logout button, and hides
 |--------|------|------|-------------|
 | `GET` | `/health` | — | Health check |
 | `GET` | `/idps` | any | List all IDP configs |
-| `POST` | `/onboard` | admin | Onboard a new IDP |
+| `GET` | `/idps/{email_domain}` | any | Fetch a single IDP by email domain |
+| `POST` | `/onboard` | admin | Onboard a new IDP (agent-admin role required) |
+| `POST` | `/onboard-user` | any | Self-service onboard — any authenticated user |
 | `POST` | `/update` | admin | Update an existing IDP |
 | `POST` | `/chat` | any | Conversational interface |
 | `GET` | `/skill/schema` | — | IDP field schema |
 
-### Usage (Item 1)
+### Usage
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/usage/summary` | Total tokens + cost by operation (last 30 days) |
-| `GET` | `/usage/by-provider` | Breakdown by OpenAI vs Gemini |
-| `GET` | `/usage/timeline` | Daily token usage over last 30 days |
-| `GET` | `/usage/operations` | Most expensive operations ranked |
-| `GET` | `/usage/recent` | 50 most recent LLM call records |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/usage/summary` | any | Total tokens + cost by operation (last 30 days) |
+| `GET` | `/usage/by-provider` | any | Breakdown by OpenAI vs Gemini |
+| `GET` | `/usage/timeline` | any | Daily token usage over last 30 days |
+| `GET` | `/usage/operations` | any | Most expensive operations ranked |
+| `GET` | `/usage/recent` | any | 50 most recent LLM call records |
 
-### Certificates (Item 3)
+### Certificates
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
@@ -186,6 +212,39 @@ When enabled, the UI shows the logged-in user's name, a logout button, and hides
 | `GET` | `/certificates/expiring` | any | IDPs with certs expiring < 30 days |
 | `POST` | `/certificates/rotate` | admin | Push a new certificate to IAM |
 | `POST` | `/certificates/schedule-scan` | admin | Check daily scan scheduler status |
+
+### Core API Proxy
+
+These endpoints proxy directly to the internal Core API (`/v2/clients/customAttributes`).
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/core/customAttributes?domainUrl=<domain>` | any | Fetch SSO attributes for a domain |
+| `POST` | `/core/customAttributes?domainUrl=<domain>` | admin | Create SSO attributes (fails with 409 if already exists) |
+| `PUT` | `/core/customAttributes?domainUrl=<domain>` | admin | Upsert SSO attributes (create or update) |
+
+## UI Sidebar Reference
+
+| Section | Item | Role | Description |
+|---------|------|------|-------------|
+| Manage | Dashboard | any | Token usage dashboard |
+| Manage | List IDPs | any | All registered IDPs |
+| Manage | Get IDP by Domain | any | Look up one IDP; supports email input (domain auto-extracted); inline edit and clone |
+| Actions | Onboard IDP | admin | Full agent-assisted onboard flow |
+| Actions | Add My IDP | any | Self-service onboard — pre-fills domain from logged-in user's email |
+| Actions | Update IDP | admin | Fetch and edit an existing IDP |
+| Actions | Chat | any | Conversational agent interface |
+| Certificates | Certificate Status | any | Scan and view expiry status |
+| Certificates | Expiring Soon | any | Certs expiring within 30 days |
+| Certificates | Rotate Certificate | admin | Push a new certificate |
+| Advanced | Core Attributes | any/admin | Direct Core API attribute management |
+
+### Get IDP by Domain — inline actions
+
+After a successful domain lookup, two actions are available:
+
+- **✎ Edit** — opens an inline form pre-filled with the current SAML attributes; changes are submitted to `POST /update`
+- **⎘ Clone** — copies all SAML attributes (entity ID, SSO URL, SLO URL, certificate, protocol) into a new onboard form; the email domain field is intentionally left blank so you must supply new domains before submitting to `POST /onboard`
 
 ## Extending
 

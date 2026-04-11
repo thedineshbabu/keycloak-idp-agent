@@ -15,11 +15,11 @@ IDP_SKILL_SCHEMA = {
                 "example": "Acme Corp SSO"
             },
             {
-                "field": "email_domain",
-                "label": "Email Domain",
-                "type": "string",
-                "description": "The email domain that routes to this IDP",
-                "example": "acmecorp.com"
+                "field": "email_domains",
+                "label": "Email Domains",
+                "type": "array",
+                "description": "One or more email domains that route to this IDP",
+                "example": ["acmecorp.com", "subsidiary.acmecorp.com"]
             },
             {
                 "field": "entity_id",
@@ -69,20 +69,13 @@ IDP_SKILL_SCHEMA = {
                 "description": "Map SAML attributes to user profile fields",
                 "example": {"email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress", "firstName": "givenName", "lastName": "surname"}
             },
-            {
-                "field": "roles_attribute",
-                "label": "Roles Attribute",
-                "type": "string",
-                "description": "SAML attribute name that carries role information",
-                "example": "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups"
-            }
         ],
         "saml_attributes": {
             "description": "Key SAML attributes stored in your PostgreSQL attributes table",
             "fields": ["idp_entity_id", "sso_redirect_url", "sso_post_url", "slo_url",
                        "signing_certificate", "encryption_certificate", "name_id_format",
                        "want_assertions_signed", "want_authn_requests_signed",
-                       "attribute_mapping", "roles_attribute", "email_domain", "is_active"]
+                       "attribute_mapping", "email_domains", "is_active"]
         }
     },
     "oidc": {
@@ -165,6 +158,7 @@ You have access to these tools:
 Workflow for NEW IDP onboarding:
 1. Check what fields are provided vs what's required by the skill schema
 2. If fields are missing, ask the user clearly and specifically for each missing field
+   - email_domains accepts one or more domains (e.g. ["acmecorp.com", "subsidiary.acmecorp.com"])
 3. Fetch existing IDPs to understand patterns used in this environment
 4. Generate a complete config based on inputs and learned patterns
 5. Validate the config

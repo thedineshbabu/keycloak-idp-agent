@@ -26,6 +26,9 @@ DB_CONFIG = {
 
 IAM_SERVICE_BASE_URL = os.getenv("IAM_SERVICE_BASE_URL", "http://localhost:8080/api/v1")
 
+CORE_API_BASE_URL    = os.getenv("CORE_API_BASE_URL", "")
+CORE_API_BEARER_TOKEN = os.getenv("CORE_API_BEARER_TOKEN", "")
+
 
 # ── Database helpers ──────────────────────────────────────────────────────────
 
@@ -39,8 +42,8 @@ def fetch_existing_idps(limit: int = 20) -> list[dict]:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT idp_name, email_domain, protocol, entity_id, sso_url,
-                   name_id_format, attribute_mapping, roles_attribute,
+            SELECT idp_name, email_domains, protocol, entity_id, sso_url,
+                   name_id_format, attribute_mapping,
                    want_assertions_signed, is_active, created_at
             FROM idp_configurations
             ORDER BY created_at DESC
@@ -55,13 +58,28 @@ def fetch_existing_idps(limit: int = 20) -> list[dict]:
         return _mock_existing_idps()
 
 
-def fetch_idp_by_domain(email_domain: str) -> Optional[dict]:
-    """Fetch a specific IDP config by email domain."""
+def fetch_idp_by_domain(email_domain: str, token: Optional[str] = None) -> Optional[dict]:
+    """
+    Fetch a specific IDP config by domain.
+    Priority: Core API → local PostgreSQL → mock fallback.
+    Passes the caller's access token to the Core API when available.
+    """
+    # Try Core API first (synchronous wrapper)
+    try:
+        core_result = asyncio.get_event_loop().run_until_complete(
+            core_get_domain_attributes(email_domain, token)
+        )
+        if core_result:
+            return core_result
+    except Exception:
+        pass
+
+    # Fall back to local DB
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT * FROM idp_configurations WHERE email_domain = %s
+            SELECT * FROM idp_configurations WHERE %s = ANY(email_domains)
         """, (email_domain,))
         row = cur.fetchone()
         cur.close()
@@ -73,30 +91,53 @@ def fetch_idp_by_domain(email_domain: str) -> Optional[dict]:
 
 # ── IAM Service API calls ─────────────────────────────────────────────────────
 
-async def push_to_iam(config: dict, operation: str = "create") -> dict:
-    """Push IDP config to IAM service POST endpoint."""
+async def push_to_iam(config: dict, operation: str = "create", token: Optional[str] = None) -> dict:
+    """
+    Push IDP config to both the IAM service and the Core API custom-attributes endpoint.
+    Core API uses PUT (upsert) for both create and update so callers don't need to
+    distinguish whether attributes already exist.
+    """
+    iam_result: dict = {}
+    core_result: dict = {}
+
+    # ── 1. IAM service ────────────────────────────────────────────────────────
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             if operation == "create":
                 response = await client.post(
                     f"{IAM_SERVICE_BASE_URL}/idp/configurations",
                     json=config,
-                    headers={"Content-Type": "application/json"}
+                    headers={"Content-Type": "application/json"},
                 )
-            else:  # update
+            else:
                 domain = config.get("email_domain")
                 response = await client.put(
                     f"{IAM_SERVICE_BASE_URL}/idp/configurations/{domain}",
                     json=config,
-                    headers={"Content-Type": "application/json"}
+                    headers={"Content-Type": "application/json"},
                 )
             response.raise_for_status()
-            return {"success": True, "data": response.json()}
+            iam_result = {"success": True, "data": response.json()}
         except httpx.HTTPStatusError as e:
-            return {"success": False, "error": f"IAM API error: {e.response.status_code} - {e.response.text}"}
-        except httpx.RequestError as e:
-            # For prototyping - simulate success if IAM service not running
-            return _mock_iam_push(config, operation)
+            iam_result = {"success": False,
+                          "error": f"IAM API error: {e.response.status_code} - {e.response.text}"}
+        except httpx.RequestError:
+            iam_result = _mock_iam_push(config, operation)
+
+    # ── 2. Core API — upsert custom attributes ────────────────────────────────
+    domains = config.get("email_domains") or []
+    if isinstance(domains, str):
+        domains = [domains]
+    primary_domain = domains[0] if domains else config.get("email_domain", "")
+    if primary_domain and (token or CORE_API_BEARER_TOKEN):
+        core_result = await core_upsert_domain_attributes(primary_domain, config, token)
+
+    # Overall success: IAM must succeed; Core API is best-effort
+    return {
+        "success": iam_result.get("success", False),
+        "iam": iam_result,
+        "core_api": core_result if core_result else {"skipped": "no token available for Core API"},
+    }
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -137,12 +178,13 @@ def validate_idp_config(config: dict, protocol: str = "saml") -> dict:
             if len(clean_cert) < rule["min_length"]:
                 warnings.append({"field": field, "message": rule["message"]})
 
-    # Domain validation
-    domain = config.get("email_domain", "")
-    if domain:
-        rule = VALIDATION_RULES["email_domain"]
-        if not re.match(rule["pattern"], domain):
-            errors.append({"field": "email_domain", "label": "Email Domain", "message": rule["message"]})
+        if field_type == "array":
+            domains = value if isinstance(value, list) else [value]
+            rule = VALIDATION_RULES["email_domain"]
+            for d in domains:
+                if not re.match(rule["pattern"], str(d)):
+                    errors.append({"field": field, "label": field_def["label"],
+                                   "message": f"'{d}': {rule['message']}"})
 
     return {
         "valid": len(errors) == 0,
@@ -166,13 +208,16 @@ async def simulate_auth_flow(config: dict) -> dict:
     passed = True
 
     # Step 1: Email domain routing check
-    domain = config.get("email_domain")
+    domains = config.get("email_domains") or []
+    if isinstance(domains, str):
+        domains = [domains]
+    domain = domains[0] if domains else None
     steps.append({
         "step": "Email Domain Routing",
-        "status": "pass" if domain else "fail",
-        "detail": f"Domain '{domain}' will route auth requests to this IDP" if domain else "Email domain missing"
+        "status": "pass" if domains else "fail",
+        "detail": f"Domains {domains} will route auth requests to this IDP" if domains else "Email domains missing"
     })
-    if not domain:
+    if not domains:
         passed = False
 
     # Step 2: SAML attribute mapping check
@@ -222,10 +267,9 @@ async def simulate_auth_flow(config: dict) -> dict:
 
     # Step 5: JWT enrichment simulation
     simulated_token_claims = {
-        "sub": f"user@{domain}",
-        "email": f"user@{domain}",
+        "sub": f"user@{domain or 'unknown'}",
+        "email": f"user@{domain or 'unknown'}",
         "idp": config.get("idp_name"),
-        "roles": ["<roles from your DB role store>"],
         "iss": "keycloak",
         "iat": int(datetime.now(timezone.utc).timestamp())
     }
@@ -259,19 +303,22 @@ def generate_idp_config(inputs: dict, existing_patterns: list[dict]) -> dict:
     }
 
     if existing_patterns:
-        # Use most common name_id_format from existing configs
         name_ids = [p.get("name_id_format") for p in existing_patterns if p.get("name_id_format")]
         if name_ids:
             default_name_id = max(set(name_ids), key=name_ids.count)
-
-        # Use most common attribute mapping
         mappings = [p.get("attribute_mapping") for p in existing_patterns if p.get("attribute_mapping")]
         if mappings:
-            default_attr_mapping = mappings[0]  # Use most recent as baseline
+            default_attr_mapping = mappings[0]
+
+    # Normalise email_domains — accept list or comma-separated string
+    raw_domains = inputs.get("email_domains") or []
+    if isinstance(raw_domains, str):
+        raw_domains = [d.strip() for d in raw_domains.split(",") if d.strip()]
+    email_domains = raw_domains
 
     config = {
         "idp_name": inputs.get("idp_name"),
-        "email_domain": inputs.get("email_domain"),
+        "email_domains": email_domains,
         "protocol": inputs.get("protocol", "saml"),
         "entity_id": inputs.get("entity_id"),
         "sso_url": inputs.get("sso_url"),
@@ -279,18 +326,134 @@ def generate_idp_config(inputs: dict, existing_patterns: list[dict]) -> dict:
         "certificate": inputs.get("certificate"),
         "name_id_format": inputs.get("name_id_format", default_name_id),
         "attribute_mapping": inputs.get("attribute_mapping", default_attr_mapping),
-        "roles_attribute": inputs.get("roles_attribute", "groups"),
         "want_assertions_signed": True,
         "want_authn_requests_signed": False,
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
-    # Merge any extra attributes
     if inputs.get("extra_attributes"):
         config.update(inputs["extra_attributes"])
 
     return config
+
+
+# ── Core API Client (/v2/clients/customAttributes) ───────────────────────────
+# Maps to the KFOne Core API Postman collection endpoints:
+#   GET  /v2/clients/customAttributes?domainUrl=…  → getDomainAttributes
+#   POST /v2/clients/customAttributes?domainUrl=…  → createClientCustomAttributes
+#   PUT  /v2/clients/customAttributes?domainUrl=…  → upsertClientCustomAttributes
+
+def _core_headers(token: Optional[str] = None) -> dict:
+    bearer = token or CORE_API_BEARER_TOKEN
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {bearer}",
+    }
+
+
+def _idp_to_core_payload(config: dict) -> dict:
+    """Map internal IDP config fields → Core API custom-attributes payload."""
+    payload = {}
+    _map = {
+        "idpEntityId":                 config.get("entity_id"),
+        "singleSignOnServiceUrl":      config.get("sso_url"),
+        "singleLogoutServiceUrl":      config.get("slo_url"),
+        "idpX509Cert":                 config.get("certificate"),
+        "assertionSigned":             config.get("want_assertions_signed"),
+        "authnRequestsSigned":         config.get("want_authn_requests_signed"),
+        # passthrough fields that live on the SP side
+        "entityId":                    config.get("sp_entity_id"),
+        "assertionConsumerServiceUrl": config.get("acs_url"),
+        "spX509Cert":                  config.get("sp_certificate"),
+        "privateKey":                  config.get("sp_private_key"),
+        "validateSignature":           config.get("validate_signature"),
+        "assertionEncrypted":          config.get("assertion_encrypted"),
+    }
+    # Omit keys whose value is None so the API only receives explicit fields
+    return {k: v for k, v in _map.items() if v is not None}
+
+
+def _core_to_idp_config(resp: dict, domain_url: str) -> dict:
+    """Map Core API custom-attributes response → internal IDP config fields."""
+    return {
+        "email_domains":              [domain_url],
+        "entity_id":                  resp.get("idpEntityId"),
+        "sso_url":                    resp.get("singleSignOnServiceUrl"),
+        "slo_url":                    resp.get("singleLogoutServiceUrl"),
+        "certificate":                resp.get("idpX509Cert"),
+        "want_assertions_signed":     resp.get("assertionSigned", False),
+        "want_authn_requests_signed": resp.get("authnRequestsSigned", False),
+        # SP-side fields — kept as-is under new names
+        "sp_entity_id":               resp.get("entityId"),
+        "acs_url":                    resp.get("assertionConsumerServiceUrl"),
+        "sp_certificate":             resp.get("spX509Cert"),
+        "sp_private_key":             resp.get("privateKey"),
+        "validate_signature":         resp.get("validateSignature", False),
+        "assertion_encrypted":        resp.get("assertionEncrypted", False),
+        "protocol":                   "saml",
+    }
+
+
+async def core_get_domain_attributes(domain_url: str, token: Optional[str] = None) -> Optional[dict]:
+    """
+    GET /v2/clients/customAttributes?domainUrl=<domain_url>
+    Returns the mapped IDP config dict on 200, None on 404.
+    Raises httpx.HTTPStatusError for any other HTTP error (401, 403, 500, …)
+    so callers can surface the real failure instead of silently returning None.
+    """
+    if not (token or CORE_API_BEARER_TOKEN):
+        return None
+    url = f"{CORE_API_BASE_URL}/v2/clients/customAttributes"
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+        resp = await client.get(url, params={"domainUrl": domain_url}, headers=_core_headers(token))
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return _core_to_idp_config(resp.json(), domain_url)
+
+
+async def core_create_domain_attributes(domain_url: str, config: dict, token: Optional[str] = None) -> dict:
+    """
+    POST /v2/clients/customAttributes?domainUrl=<domain_url>
+    Creates new SSO attributes.  Returns 409 if any attribute already exists.
+    """
+    url = f"{CORE_API_BASE_URL}/v2/clients/customAttributes"
+    payload = _idp_to_core_payload(config)
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+        try:
+            resp = await client.post(url, params={"domainUrl": domain_url},
+                                     json=payload, headers=_core_headers(token))
+            resp.raise_for_status()
+            return {"success": True, "status_code": resp.status_code, "data": resp.json()}
+        except httpx.HTTPStatusError as e:
+            return {"success": False, "status_code": e.response.status_code,
+                    "error": e.response.text}
+        except httpx.RequestError as e:
+            return {"success": False, "error": str(e)}
+
+
+async def core_upsert_domain_attributes(domain_url: str, config: dict, token: Optional[str] = None) -> dict:
+    """
+    PUT /v2/clients/customAttributes?domainUrl=<domain_url>
+    Creates missing attributes and updates changed ones (upsert).
+    Body status_code 201 = created, 200 = updated/up-to-date.
+    """
+    url = f"{CORE_API_BASE_URL}/v2/clients/customAttributes"
+    payload = _idp_to_core_payload(config)
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+        try:
+            resp = await client.put(url, params={"domainUrl": domain_url},
+                                    json=payload, headers=_core_headers(token))
+            resp.raise_for_status()
+            body = resp.json()
+            return {"success": True, "status_code": body.get("status_code", resp.status_code),
+                    "message": body.get("message", ""), "data": body}
+        except httpx.HTTPStatusError as e:
+            return {"success": False, "status_code": e.response.status_code,
+                    "error": e.response.text}
+        except httpx.RequestError as e:
+            return {"success": False, "error": str(e)}
 
 
 # ── Mock data (for prototyping without live DB/IAM) ───────────────────────────
@@ -299,25 +462,23 @@ def _mock_existing_idps() -> list[dict]:
     return [
         {
             "idp_name": "Acme Corp SSO",
-            "email_domain": "acmecorp.com",
+            "email_domains": ["acmecorp.com", "acme-subsidiary.com"],
             "protocol": "saml",
             "entity_id": "https://idp.acmecorp.com/saml",
             "sso_url": "https://idp.acmecorp.com/saml/sso",
             "name_id_format": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
             "attribute_mapping": {"email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress", "firstName": "givenName", "lastName": "surname"},
-            "roles_attribute": "groups",
             "want_assertions_signed": True,
             "is_active": True
         },
         {
             "idp_name": "Beta Inc Azure AD",
-            "email_domain": "betainc.com",
+            "email_domains": ["betainc.com"],
             "protocol": "saml",
             "entity_id": "https://sts.windows.net/beta-tenant-id/",
             "sso_url": "https://login.microsoftonline.com/beta-tenant-id/saml2",
             "name_id_format": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
             "attribute_mapping": {"email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress", "firstName": "givenName", "lastName": "surname"},
-            "roles_attribute": "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups",
             "want_assertions_signed": True,
             "is_active": True
         }
@@ -326,7 +487,7 @@ def _mock_existing_idps() -> list[dict]:
 
 def _mock_idp_by_domain(domain: str) -> Optional[dict]:
     idps = _mock_existing_idps()
-    return next((i for i in idps if i["email_domain"] == domain), None)
+    return next((i for i in idps if domain in i.get("email_domains", [])), None)
 
 
 def _mock_iam_push(config: dict, operation: str) -> dict:
@@ -503,9 +664,12 @@ def scan_all_certificates() -> list[dict]:
             expiry_info = parse_certificate_expiry(cert)
         else:
             expiry_info = {"status": "no_cert", "message": "No certificate configured"}
+        domains = idp.get("email_domains") or []
+        if isinstance(domains, str):
+            domains = [domains]
         results.append({
             "idp_name": idp["idp_name"],
-            "email_domain": idp["email_domain"],
+            "email_domains": domains,
             "certificate_status": expiry_info,
         })
     return results
@@ -518,6 +682,8 @@ def log_cert_alerts(expiring: list):
         cur = conn.cursor()
         for item in expiring:
             cs = item["certificate_status"]
+            domains = item.get("email_domains") or []
+            primary_domain = domains[0] if domains else ""
             cur.execute("""
                 INSERT INTO cert_alerts (idp_name, email_domain, days_remaining, expiry_date, created_at)
                 VALUES (%s, %s, %s, %s, NOW())
@@ -525,7 +691,7 @@ def log_cert_alerts(expiring: list):
                     SET days_remaining = EXCLUDED.days_remaining,
                         expiry_date    = EXCLUDED.expiry_date,
                         created_at     = NOW()
-            """, (item["idp_name"], item["email_domain"],
+            """, (item["idp_name"], primary_domain,
                   cs.get("days_remaining"), cs.get("expiry_date")))
         conn.commit()
         cur.close()
