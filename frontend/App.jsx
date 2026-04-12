@@ -69,24 +69,6 @@ const makeStyles = (C) => ({
     color: C.textMuted,
     marginTop: "2px",
   },
-  llmBadge: {
-    display: "flex",
-    gap: "8px",
-    alignItems: "center",
-  },
-  badge: (active) => ({
-    padding: "4px 12px",
-    borderRadius: "4px",
-    fontSize: "11px",
-    fontWeight: 600,
-    cursor: "pointer",
-    border: `1px solid ${active ? C.accent : C.border}`,
-    backgroundColor: active ? C.accentGlow + "33" : "transparent",
-    color: active ? C.accent : C.textMuted,
-    transition: "all 0.15s",
-    textTransform: "uppercase",
-    letterSpacing: "0.05em",
-  }),
   main: {
     display: "flex",
     flex: 1,
@@ -329,6 +311,7 @@ function apiFetch(path, opts = {}) {
 
 /** Extract a readable string from a FastAPI error response body. */
 function apiErrorMsg(body, status) {
+  if (status === 403) return "You need admin privileges to perform this action";
   if (!body || typeof body !== "object") return `HTTP ${status}`;
   // FastAPI wraps downstream text in `detail`; that text may itself be JSON
   let detail = body.detail;
@@ -407,20 +390,6 @@ function DomainTagInput({ value, onChange }) {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function LLMSelector({ value, onChange }) {
-  const S = useStyles();
-  const C = useColors();
-  return (
-    <div style={S.llmBadge}>
-      <span style={{ fontSize: "10px", color: C.textMuted, marginRight: "4px" }}>LLM:</span>
-      {["openai", "gemini"].map((p) => (
-        <button key={p} style={S.badge(value === p)} onClick={() => onChange(p)}>
-          {p}
-        </button>
-      ))}
-    </div>
-  );
-}
 
 function ThemeToggle({ theme, onToggle }) {
   const C = useColors();
@@ -536,7 +505,7 @@ function ResultPanel({ result }) {
 
 // ── Views ─────────────────────────────────────────────────────────────────────
 
-function OnboardView({ llmProvider }) {
+function OnboardView() {
   const C = useColors();
   const S = useStyles();
   const [form, setForm] = useState({
@@ -555,7 +524,7 @@ function OnboardView({ llmProvider }) {
       const res = await apiFetch("/onboard", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form, llm_provider: llmProvider }),
+        body: JSON.stringify(form),
       });
       setResult(await res.json());
     } catch (e) {
@@ -625,7 +594,7 @@ function OnboardView({ llmProvider }) {
   );
 }
 
-function UpdateView({ llmProvider }) {
+function UpdateView() {
   const C = useColors();
   const S = useStyles();
   const [domain, setDomain] = useState("");
@@ -661,7 +630,7 @@ function UpdateView({ llmProvider }) {
       const res = await apiFetch("/update", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email_domain: domain, updates, llm_provider: llmProvider }),
+        body: JSON.stringify({ email_domain: domain, updates }),
       });
       setResult(await res.json());
     } catch (e) {
@@ -742,7 +711,7 @@ function UpdateView({ llmProvider }) {
   );
 }
 
-function GetIDPView({ llmProvider }) {
+function GetIDPView({ isAdmin }) {
   const C = useColors();
   const S = useStyles();
   const [input, setInput] = useState("");
@@ -798,7 +767,7 @@ function GetIDPView({ llmProvider }) {
       const res = await apiFetch("/update", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email_domain: parsedDomain, updates, llm_provider: llmProvider ?? "openai" }),
+        body: JSON.stringify({ email_domain: parsedDomain, updates }),
       });
       const data = await res.json();
       setSaveResult(data);
@@ -835,7 +804,7 @@ function GetIDPView({ llmProvider }) {
       const res = await apiFetch("/onboard", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...cloneForm, llm_provider: llmProvider ?? "openai" }),
+        body: JSON.stringify(cloneForm),
       });
       const data = await res.json();
       setCloneResult(data);
@@ -888,20 +857,22 @@ function GetIDPView({ llmProvider }) {
               <div style={{ fontSize: "11px", color: C.success }}>
                 ✓ Found: <span style={{ color: C.text, fontWeight: 600 }}>{idp.idp_name}</span>
               </div>
-              <div style={{ display: "flex", gap: "8px" }}>
-                <button
-                  style={{ ...S.btn("secondary"), padding: "4px 14px", fontSize: "11px" }}
-                  onClick={() => { setMode("edit"); setSaveResult(null); }}
-                >
-                  ✎ Edit
-                </button>
-                <button
-                  style={{ ...S.btn("secondary"), padding: "4px 14px", fontSize: "11px", borderColor: C.accent, color: C.accent }}
-                  onClick={startClone}
-                >
-                  ⎘ Clone
-                </button>
-              </div>
+              {isAdmin && (
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button
+                    style={{ ...S.btn("secondary"), padding: "4px 14px", fontSize: "11px" }}
+                    onClick={() => { setMode("edit"); setSaveResult(null); }}
+                  >
+                    ✎ Edit
+                  </button>
+                  <button
+                    style={{ ...S.btn("secondary"), padding: "4px 14px", fontSize: "11px", borderColor: C.accent, color: C.accent }}
+                    onClick={startClone}
+                  >
+                    ⎘ Clone
+                  </button>
+                </div>
+              )}
             </div>
             {Object.entries(idp).map(([k, v]) => (
               <div key={k} style={{ display: "flex", gap: "16px", padding: "6px 0", borderBottom: `1px solid ${C.border}`, fontSize: "12px" }}>
@@ -1065,7 +1036,7 @@ function GetIDPView({ llmProvider }) {
   );
 }
 
-function MyIDPView({ llmProvider, user }) {
+function MyIDPView({ user }) {
   const C = useColors();
   const S = useStyles();
   const defaultDomain = user?.email?.split("@")[1] ?? "";
@@ -1085,7 +1056,7 @@ function MyIDPView({ llmProvider, user }) {
       const res = await apiFetch("/onboard-user", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form, llm_provider: llmProvider }),
+        body: JSON.stringify(form),
       });
       setResult(await res.json());
     } catch (e) {
@@ -1393,7 +1364,7 @@ function UsageView() {
 
 // ── Certificate View ──────────────────────────────────────────────────────────
 
-function CertificatesView() {
+function CertificatesView({ isAdmin }) {
   const C = useColors();
   const S = useStyles();
   const [certs, setCerts] = useState([]);
@@ -1490,37 +1461,39 @@ function CertificatesView() {
         })}
       </div>
 
-      <div style={S.card}>
-        <div style={S.cardTitle}>◈ Rotate Certificate</div>
-        <div style={{ ...S.grid2, marginBottom: "16px" }}>
+      {isAdmin && (
+        <div style={S.card}>
+          <div style={S.cardTitle}>◈ Rotate Certificate</div>
+          <div style={{ ...S.grid2, marginBottom: "16px" }}>
+            <div style={S.fieldGroup}>
+              <label style={S.label}>Email Domain</label>
+              <input style={S.input} placeholder="acmecorp.com" value={rotateDomain}
+                onChange={(e) => setRotateDomain(e.target.value)} />
+            </div>
+          </div>
           <div style={S.fieldGroup}>
-            <label style={S.label}>Email Domain</label>
-            <input style={S.input} placeholder="acmecorp.com" value={rotateDomain}
-              onChange={(e) => setRotateDomain(e.target.value)} />
+            <label style={S.label}>New Certificate (PEM or base64)</label>
+            <textarea style={S.textarea} rows={5}
+              placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+              value={newCert} onChange={(e) => setNewCert(e.target.value)} />
           </div>
-        </div>
-        <div style={S.fieldGroup}>
-          <label style={S.label}>New Certificate (PEM or base64)</label>
-          <textarea style={S.textarea} rows={5}
-            placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
-            value={newCert} onChange={(e) => setNewCert(e.target.value)} />
-        </div>
-        <div style={{ marginTop: "16px" }}>
-          <button style={S.btn("primary")} onClick={submitRotate}
-            disabled={rotating || !rotateDomain || !newCert}>
-            {rotating ? "⟳ Rotating..." : "▶ Rotate Certificate"}
-          </button>
-        </div>
-        {rotateResult && (
-          <div style={{ marginTop: "16px", padding: "12px", borderRadius: "4px",
-            backgroundColor: C.surfaceAlt, fontSize: "11px",
-            color: rotateResult.status === "success" ? C.success : C.error }}>
-            {rotateResult.status === "success"
-              ? `✓ Certificate rotated for ${rotateDomain}`
-              : `✗ ${rotateResult.message || rotateResult.status}`}
+          <div style={{ marginTop: "16px" }}>
+            <button style={S.btn("primary")} onClick={submitRotate}
+              disabled={rotating || !rotateDomain || !newCert}>
+              {rotating ? "⟳ Rotating..." : "▶ Rotate Certificate"}
+            </button>
           </div>
-        )}
-      </div>
+          {rotateResult && (
+            <div style={{ marginTop: "16px", padding: "12px", borderRadius: "4px",
+              backgroundColor: C.surfaceAlt, fontSize: "11px",
+              color: rotateResult.status === "success" ? C.success : C.error }}>
+              {rotateResult.status === "success"
+                ? `✓ Certificate rotated for ${rotateDomain}`
+                : `✗ ${rotateResult.message || rotateResult.status}`}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1984,7 +1957,7 @@ function ClientExplorerView() {
 
 // ── User Management ───────────────────────────────────────────────────────────
 
-function UserManagementView() {
+function UserManagementView({ isAdmin }) {
   const C = useColors();
   const S = useStyles();
   const [email, setEmail]         = useState("");
@@ -2158,18 +2131,24 @@ function UserManagementView() {
             </div>
 
             {/* Action buttons */}
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "12px" }}>
-              {ACTIONS.map(({ id, label, v }) => (
-                <button
-                  key={id}
-                  style={{ ...S.btn(v), padding: "8px 14px", fontSize: "11px", opacity: actionBusy ? 0.6 : 1 }}
-                  onClick={() => doAction(id)}
-                  disabled={!!actionBusy}
-                >
-                  {actionBusy === id ? "…" : label}
-                </button>
-              ))}
-            </div>
+            {isAdmin ? (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "12px" }}>
+                {ACTIONS.map(({ id, label, v }) => (
+                  <button
+                    key={id}
+                    style={{ ...S.btn(v), padding: "8px 14px", fontSize: "11px", opacity: actionBusy ? 0.6 : 1 }}
+                    onClick={() => doAction(id)}
+                    disabled={!!actionBusy}
+                  >
+                    {actionBusy === id ? "…" : label}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div style={{ marginBottom: "12px", padding: "10px 14px", borderRadius: "4px", fontSize: "12px", backgroundColor: "#f5a62318", color: "#f5a623" }}>
+                You need admin privileges to perform this action
+              </div>
+            )}
 
             {actionMsg && (
               <div style={{
@@ -2198,6 +2177,7 @@ function sourceService(toolName) {
   if (toolName.startsWith("keycloak_")) return "keycloak";
   if (toolName.startsWith("iam_"))      return "iam";
   if (toolName.startsWith("core_"))     return "core";
+  if (toolName.startsWith("dd_"))       return "datadog";
   return "other";
 }
 
@@ -2205,6 +2185,7 @@ function sourceColor(C, service) {
   if (service === "keycloak") return C.accent;
   if (service === "iam")      return C.success;
   if (service === "core")     return C.warning;
+  if (service === "datadog")  return "#632CA6";
   return C.textMuted;
 }
 
@@ -2229,13 +2210,22 @@ const CHAT_SUGGESTIONS = [
   { text: "Search for client Acme",                   svc: "core"     },
   { text: "What's the login mode for acmecorp.com?",  svc: "core"     },
   { text: "Show SSO config for acmecorp.com",         svc: "core"     },
+  { text: "Why can't user john@example.com log in?",        svc: "datadog" },
+  { text: "Show auth errors for login service in last hour", svc: "datadog" },
+  { text: "What's the error rate for the login service?",    svc: "datadog" },
+  { text: "Are there active alerts on authentication?",      svc: "datadog" },
 ];
 
 // ── Markdown renderer for assistant messages ─────────────────────────────────
 
 // Renders **bold** and `code` spans inline
+function stripMdEscapes(text) {
+  return text.replace(/\\([_*~`|])/g, "$1");
+}
+
 function renderInlineMd(text) {
-  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  const clean = stripMdEscapes(text);
+  const parts = clean.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
   return parts.map((part, i) => {
     if (part.startsWith("**") && part.endsWith("**"))
       return <strong key={i}>{part.slice(2, -2)}</strong>;
@@ -2254,8 +2244,8 @@ function renderInlineMd(text) {
 
 // Renders a comma-separated value as small tag chips when count > 3
 function TagChips({ value, C }) {
-  const tags = value.split(",").map((t) => t.trim()).filter(Boolean);
-  if (tags.length <= 3) return <span style={{ wordBreak: "break-word" }}>{value}</span>;
+  const tags = value.split(",").map((t) => stripMdEscapes(t.trim())).filter(Boolean);
+  if (tags.length <= 3) return <span style={{ wordBreak: "break-word" }}>{tags.join(", ")}</span>;
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", marginTop: "3px" }}>
       {tags.map((tag, i) => (
@@ -2375,7 +2365,7 @@ function MarkdownMessage({ text, C }) {
 
 // ── Unified Chat View ────────────────────────────────────────────────────────
 
-function UnifiedChatView({ llmProvider, user }) {
+function UnifiedChatView({ user }) {
   const C = useColors();
   const S = useStyles();
 
@@ -2448,7 +2438,6 @@ function UnifiedChatView({ llmProvider, user }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: text,
-          llm_provider: llmProvider,
           realm,
           session_id: activeSession || undefined,
         }),
@@ -2474,9 +2463,14 @@ function UnifiedChatView({ llmProvider, user }) {
           token_usage: data.token_usage || null,
         }]);
       } else {
+        let errMsg = "Error: could not reach the server.";
+        try {
+          const errData = await res.json();
+          if (errData.detail) errMsg = errData.detail;
+        } catch {}
         setMessages((prev) => [...prev, {
           role: "assistant",
-          message: "Error: could not reach the server.",
+          message: errMsg,
           created_at: new Date().toISOString(),
         }]);
       }
@@ -2877,7 +2871,6 @@ function TokenSetupView() {
 
 export default function App() {
   const [view, setView]         = useState("clients");
-  const [llmProvider, setLlm]   = useState("gemini");
   const [theme, setTheme]        = useState("dark");
   const auth                     = useOidcAuth();
 
@@ -2913,7 +2906,7 @@ export default function App() {
 
   // ── Authenticated shell ────────────────────────────────────────────────────
   const { user, token } = auth;
-  const isAdmin = user?.roles?.includes("agent-admin") ?? true;
+  const isAdmin = user?.roles?.includes("agent-admin") ?? false;
 
   const navItems = [
     { id: "clients",      label: "Client Explorer",    section: "Platform"     },
@@ -2939,7 +2932,6 @@ export default function App() {
             <div style={S.headerSub}>Platform Intelligence &amp; Management</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
-            <LLMSelector value={llmProvider} onChange={setLlm} />
             <ThemeToggle theme={theme} onToggle={() => setTheme((t) => t === "dark" ? "lite" : "dark")} />
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <span style={{ fontSize: "11px", color: C.textDim }}>
@@ -2972,14 +2964,14 @@ export default function App() {
 
           <main style={S.content}>
             {view === "clients"      && <ClientExplorerView />}
-            {view === "users"        && <UserManagementView />}
-            {view === "onboard"      && <OnboardView llmProvider={llmProvider} />}
-            {view === "update"       && <UpdateView llmProvider={llmProvider} />}
-            {view === "get-idp"      && <GetIDPView llmProvider={llmProvider} />}
-            {view === "my-idp"       && <MyIDPView llmProvider={llmProvider} user={user} />}
+            {view === "users"        && <UserManagementView isAdmin={isAdmin} />}
+            {view === "onboard"      && <OnboardView />}
+            {view === "update"       && <UpdateView />}
+            {view === "get-idp"      && <GetIDPView isAdmin={isAdmin} />}
+            {view === "my-idp"       && <MyIDPView user={user} />}
             {view === "usage"        && <UsageView />}
-            {view === "certificates" && <CertificatesView />}
-            {view === "assistant"    && <UnifiedChatView llmProvider={llmProvider} user={user} />}
+            {view === "certificates" && <CertificatesView isAdmin={isAdmin} />}
+            {view === "assistant"    && <UnifiedChatView user={user} />}
             {view === "token-setup"  && <TokenSetupView />}
           </main>
         </div>

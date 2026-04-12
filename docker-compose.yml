@@ -22,7 +22,7 @@ services:
   # ── FastAPI backend ─────────────────────────────────────────────────────────
   backend:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
@@ -36,10 +36,16 @@ services:
       DB_USER:               ${DB_USER:-iam_user}
       DB_PASSWORD:           ${DB_PASSWORD:-iam_pass}
       IAM_SERVICE_BASE_URL:  ${IAM_SERVICE_BASE_URL:-http://localhost:8080/api/v1}
+      CORE_API_BASE_URL:     ${CORE_API_BASE_URL:-}
+      CORE_API_BEARER_TOKEN: ${CORE_API_BEARER_TOKEN:-}
+      IAM_API_BASE_URL:      ${IAM_API_BASE_URL:-}
       KEYCLOAK_ENABLED:      ${KEYCLOAK_ENABLED:-false}
       KEYCLOAK_URL:          ${KEYCLOAK_URL:-}
       KEYCLOAK_REALM:        ${KEYCLOAK_REALM:-}
       KEYCLOAK_CLIENT_ID:    ${KEYCLOAK_CLIENT_ID:-idp-agent-ui}
+      DATADOG_API_KEY:       ${DATADOG_API_KEY:-}
+      DATADOG_APP_KEY:       ${DATADOG_APP_KEY:-}
+      DATADOG_SITE:          ${DATADOG_SITE:-datadoghq.com}
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,8 +53,8 @@ services:
   # ── React frontend (nginx) ──────────────────────────────────────────────────
   frontend:
     build:
-      context: .
-      dockerfile: Dockerfile.frontend
+      context: ./frontend
+      dockerfile: Dockerfile
       args:
         VITE_API_URL:            ${VITE_API_URL:-http://localhost:8000}
         VITE_KEYCLOAK_ENABLED:   ${VITE_KEYCLOAK_ENABLED:-false}

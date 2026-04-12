@@ -41,8 +41,8 @@ jobs:
       dockerBaseImage: "node:20-alpine"
       dockerRepository: "kfone-idp-agent/ui"
       environment: "${{ inputs.environment }}"
-      workspace: "."
-      dockerFile: "Dockerfile.frontend"
+      workspace: "frontend"
+      dockerFile: "Dockerfile"
 
   Tagging:
     name: Build Tag

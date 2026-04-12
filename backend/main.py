@@ -1,7 +1,8 @@
-from dotenv import load_dotenv
-load_dotenv()  # Must run before any project module is imported (they read env vars at module level)
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(usecwd=True))  # Must run before any project module is imported (they read env vars at module level)
 
 from contextlib import asynccontextmanager
+import logging
 import os
 from typing import Optional
 
@@ -9,6 +10,8 @@ import json
 
 import httpx
 import uvicorn
+
+log = logging.getLogger(__name__)
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -41,8 +44,8 @@ from tools import (
     core_create_domain_attributes,
     core_get_domain_attributes,
     core_upsert_domain_attributes,
-    fetch_idp_by_domain,
     get_chat_sessions,
+    get_daily_query_count,
     get_recent_usage,
     get_session_messages,
     get_usage_by_provider,
@@ -51,6 +54,10 @@ from tools import (
     save_chat_message,
     scan_all_certificates,
 )
+
+# ── Guardrail config ─────────────────────────────────────────────────────────
+DEFAULT_LLM_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "gemini")
+DAILY_QUERY_LIMIT    = int(os.getenv("DAILY_QUERY_LIMIT", "10"))
 
 
 def _downstream_detail(exc: httpx.HTTPStatusError) -> str:
@@ -94,6 +101,11 @@ except ImportError:
 async def lifespan(app: FastAPI):
     if _has_scheduler:
         _scheduler.start()
+    from datadog_api import dd_available
+    if dd_available():
+        log.info("Datadog integration enabled (DATADOG_SITE=%s)", os.getenv("DATADOG_SITE", "datadoghq.com"))
+    else:
+        log.info("Datadog integration disabled (DATADOG_API_KEY/DATADOG_APP_KEY not set)")
     yield
     if _has_scheduler:
         _scheduler.shutdown(wait=False)
@@ -128,19 +140,16 @@ class OnboardRequest(BaseModel):
     email_domains: Optional[list] = None   # one or more email domains
     metadata_xml: Optional[str] = None
     extra_attributes: Optional[dict] = None
-    llm_provider: str = "openai"
 
 
 class UpdateRequest(BaseModel):
     email_domain: str
     updates: dict
-    llm_provider: str = "openai"
 
 
 class ChatRequest(BaseModel):
     message: str
     context: Optional[dict] = None     # kept for backwards compatibility
-    llm_provider: str = "openai"
     session_id: Optional[str] = None   # omit to start a new session
     realm: Optional[str] = None        # Keycloak realm (defaults to KEYCLOAK_REALM env var)
 
@@ -148,13 +157,11 @@ class ChatRequest(BaseModel):
 class RotateRequest(BaseModel):
     email_domain: str
     new_certificate: str
-    llm_provider: str = "openai"
 
 
 class PolicyQueryRequest(BaseModel):
     question: str
     realm: str = "master"
-    llm_provider: str = "openai"
     session_id: Optional[str] = None   # omit to start a new policy session
 
 
@@ -163,6 +170,27 @@ class PolicyQueryRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/config")
+def get_config():
+    """Return client-visible configuration (guardrails, provider)."""
+    return {
+        "llm_provider": DEFAULT_LLM_PROVIDER,
+        "daily_query_limit": DAILY_QUERY_LIMIT,
+    }
+
+
+def _check_rate_limit(user_sub: str):
+    """Raise 429 if the user has exceeded today's query limit."""
+    if DAILY_QUERY_LIMIT <= 0:
+        return
+    count = get_daily_query_count(user_sub)
+    if count >= DAILY_QUERY_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily query limit reached ({DAILY_QUERY_LIMIT}). Try again tomorrow.",
+        )
 
 
 @app.get("/idps")
@@ -200,21 +228,21 @@ async def get_idp(email_domain: str, user: dict = Depends(verify_token)):
 @app.post("/onboard")
 async def onboard_idp(req: OnboardRequest, user: dict = Depends(require_admin)):
     """Onboard a new IDP (admin only)."""
-    result = await agent.onboard_idp(req.dict(), req.llm_provider, token=user.get("access_token"))
+    result = await agent.onboard_idp(req.dict(), DEFAULT_LLM_PROVIDER, token=user.get("access_token"))
     return result
 
 
 @app.post("/onboard-user")
 async def onboard_idp_self(req: OnboardRequest, user: dict = Depends(verify_token)):
     """Self-service onboard — any authenticated user can register an IDP for their own email domain."""
-    result = await agent.onboard_idp(req.dict(), req.llm_provider, token=user.get("access_token"))
+    result = await agent.onboard_idp(req.dict(), DEFAULT_LLM_PROVIDER, token=user.get("access_token"))
     return result
 
 
 @app.post("/update")
 async def update_idp(req: UpdateRequest, user: dict = Depends(require_admin)):
     """Update an existing IDP (admin only)."""
-    result = await agent.update_idp(req.email_domain, req.updates, req.llm_provider, token=user.get("access_token"))
+    result = await agent.update_idp(req.email_domain, req.updates, DEFAULT_LLM_PROVIDER, token=user.get("access_token"))
     return result
 
 
@@ -226,8 +254,12 @@ async def chat(req: ChatRequest, user: dict = Depends(verify_token)):
     Every turn is persisted to the user's chat history.
     """
     import uuid
-    session_id = req.session_id or str(uuid.uuid4())
     user_sub   = user.get("sub", "anonymous")
+
+    # ── Rate limit check ─────────────────────────────────────────────────────
+    _check_rate_limit(user_sub)
+
+    session_id = req.session_id or str(uuid.uuid4())
     user_email = user.get("email", "")
     token      = user.get("access_token")
     realm      = req.realm or os.getenv("KEYCLOAK_REALM", "master")
@@ -246,7 +278,8 @@ async def chat(req: ChatRequest, user: dict = Depends(verify_token)):
         history=history,
         realm=realm,
         token=token,
-        provider=req.llm_provider,
+        provider=DEFAULT_LLM_PROVIDER,
+        user_roles=user.get("roles", []),
     )
 
     reply = result.get("reply", "")
@@ -331,7 +364,7 @@ async def cert_rotate(req: RotateRequest, user: dict = Depends(require_admin)):
     result = await agent.update_idp(
         req.email_domain,
         {"certificate": req.new_certificate},
-        req.llm_provider,
+        DEFAULT_LLM_PROVIDER,
         token=user.get("access_token"),
     )
     return result
@@ -362,13 +395,17 @@ async def policy_query(req: PolicyQueryRequest, user: dict = Depends(verify_toke
     The response always echoes back the ``session_id`` so the client can persist it.
     """
     import uuid as _uuid
-    session_id = req.session_id or f"policy:{_uuid.uuid4()}"
     user_sub   = user.get("sub", "anonymous")
+
+    # ── Rate limit check ─────────────────────────────────────────────────────
+    _check_rate_limit(user_sub)
+
+    session_id = req.session_id or f"policy:{_uuid.uuid4()}"
     user_email = user.get("email", "")
 
     save_chat_message(session_id, user_sub, user_email, "user", req.question)
 
-    result = await policy_engine.query(req.question, req.realm, req.llm_provider)
+    result = await policy_engine.query(req.question, req.realm, DEFAULT_LLM_PROVIDER)
 
     # Persist the full structured response as JSON so the frontend can replay it.
     save_chat_message(session_id, user_sub, user_email, "assistant", json.dumps(result))

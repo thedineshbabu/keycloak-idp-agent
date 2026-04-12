@@ -3,7 +3,6 @@ Agent Tools
 Functions the agent can call to interact with PostgreSQL, IAM service, and simulate auth flows.
 """
 import re
-import json
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -106,6 +105,26 @@ def get_session_messages(session_id: str, user_sub: str) -> list[dict]:
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def get_daily_query_count(user_sub: str) -> int:
+    """Count today's user-initiated messages (role='user') in chat_history."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM chat_history
+            WHERE user_sub = %s
+              AND role = 'user'
+              AND created_at >= CURRENT_DATE
+        """, (user_sub,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row["cnt"] if row else 0
+    except Exception:
+        return 0
 
 
 def fetch_existing_idps(limit: int = 20) -> list[dict]:
@@ -297,7 +316,7 @@ async def simulate_auth_flow(config: dict) -> dict:
         steps.append({
             "step": "SSO URL Reachability",
             "status": "pass" if reachable else "warn",
-            "detail": f"SSO endpoint responded" if reachable else f"Could not reach {sso_url} (may be internal network)"
+            "detail": "SSO endpoint responded" if reachable else f"Could not reach {sso_url} (may be internal network)"
         })
     else:
         steps.append({
@@ -396,7 +415,6 @@ def _core_headers(token: Optional[str] = None) -> dict:
 
 def _idp_to_core_payload(config: dict) -> dict:
     """Map internal IDP config fields → Core API custom-attributes payload."""
-    payload = {}
     _map = {
         "idpEntityId":                 config.get("entity_id"),
         "singleSignOnServiceUrl":      config.get("sso_url"),

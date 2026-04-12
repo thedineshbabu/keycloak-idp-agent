@@ -41,7 +41,7 @@ jobs:
       dockerBaseImage: "python:3.12-slim"
       dockerRepository: "kfone-idp-agent/api"
       environment: "${{ inputs.environment }}"
-      workspace: "."
+      workspace: "backend"
 
   Tagging:
     name: Build Tag
