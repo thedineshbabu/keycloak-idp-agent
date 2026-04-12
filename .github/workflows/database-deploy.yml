@@ -1,0 +1,106 @@
+name: kf-talentsuite-platform-agent-database-deploy
+run-name: kf-talentsuite-platform-agent-database-deploy-${{ inputs.environment }}-${{ inputs.region }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: "Environment"
+        required: true
+        default: dev
+        options:
+          - sbx
+          - dev
+          - dv2
+          - qa1
+          - stg
+          - prd
+          - dem
+      region:
+        type: choice
+        description: "AWS Region"
+        required: true
+        default: us-east-1
+        options:
+          - us-east-1
+          - eu-central-1
+          - eu-west-1
+          - us-west-2
+          - ap-southeast-2
+      patchnumber:
+        description: "Patch number (e.g. rc/v24.1.0.1-db-qa1)"
+        required: true
+        type: string
+        default: '0'
+      serviceName:
+        type: string
+        description: "Service component tag (e.g. db)"
+        required: false
+        default: 'db'
+
+jobs:
+  Deploy:
+    name: Run database migrations
+    runs-on: ${{ inputs.environment }}-${{ fromJSON('{"us-east-1":"use1","eu-central-1":"euc1","eu-west-1":"euw1","us-west-2":"usw2","ap-southeast-2":"aus"}')[inputs.region] }}-app
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Fetch database credentials from Secrets Manager
+        id: db-creds
+        run: |
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "/apps/idp-agent/${{ inputs.environment }}/db-credentials" \
+            --query SecretString --output text)
+          echo "DB_HOST=$(echo $SECRET_JSON | jq -r '.host')" >> $GITHUB_OUTPUT
+          echo "DB_PORT=$(echo $SECRET_JSON | jq -r '.port')" >> $GITHUB_OUTPUT
+          echo "DB_NAME=$(echo $SECRET_JSON | jq -r '.dbname')" >> $GITHUB_OUTPUT
+          echo "DB_USER=$(echo $SECRET_JSON | jq -r '.username')" >> $GITHUB_OUTPUT
+          echo "::add-mask::$(echo $SECRET_JSON | jq -r '.password')"
+          echo "DB_PASSWORD=$(echo $SECRET_JSON | jq -r '.password')" >> $GITHUB_OUTPUT
+
+      - name: Install yuniql CLI
+        run: |
+          dotnet tool install yuniql.cli -g --version 1.1.55
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Run yuniql migrations
+        env:
+          PGHOST: ${{ steps.db-creds.outputs.DB_HOST }}
+          PGPORT: ${{ steps.db-creds.outputs.DB_PORT }}
+          PGDATABASE: ${{ steps.db-creds.outputs.DB_NAME }}
+          PGUSER: ${{ steps.db-creds.outputs.DB_USER }}
+          PGPASSWORD: ${{ steps.db-creds.outputs.DB_PASSWORD }}
+        run: |
+          echo "Running yuniql migrations against ${{ inputs.environment }}/${{ inputs.region }}..."
+          # Ensure the application schema exists
+          psql -c "CREATE SCHEMA IF NOT EXISTS idp_agent;"
+          # Run versioned migrations
+          CONNECTION_STRING="Host=${PGHOST};Port=${PGPORT};Database=${PGDATABASE};Username=${PGUSER};Password=${PGPASSWORD};SslMode=Require;TrustServerCertificate=true"
+          cd yuniql/scripts
+          yuniql run \
+            -p . \
+            --platform postgresql \
+            --connection-string "${CONNECTION_STRING}" \
+            --meta-table db_migration_yuniql_idp_agent \
+            --auto-create-db false
+          echo "Database migration completed successfully."
+
+  Tagging:
+    name: Deploy Tag
+    needs: [Deploy]
+    if: ${{ inputs.environment == 'qa1' || inputs.environment == 'stg' || inputs.environment == 'prd' || inputs.environment == 'dem' }}
+    uses: HayGroup/kfone-common/.github/workflows/create-deployment-tag-0.0.1.yml@main
+    secrets: inherit
+    with:
+      environment: ${{ inputs.environment }}
+      region: ${{ inputs.region }}
+      patchnumber: ${{ inputs.patchnumber }}
+      serviceName: ${{ inputs.serviceName }}

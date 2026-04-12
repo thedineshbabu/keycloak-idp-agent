@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-iam_pass}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./yuniql/scripts/v0.00:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
     healthcheck:

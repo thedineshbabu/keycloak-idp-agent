@@ -1,0 +1,91 @@
+name: kf-talentsuite-platform-agent-frontend-deploy
+run-name: kf-talentsuite-platform-agent-frontend-deploy-${{ inputs.environment }}-${{ inputs.region }}-${{ inputs.imageTag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: "Environment"
+        required: true
+        default: dev
+        options:
+          - sbx
+          - dev
+          - dv2
+          - qa1
+          - stg
+          - prd
+          - dem
+      region:
+        type: choice
+        description: "AWS Region"
+        required: true
+        default: us-east-1
+        options:
+          - us-east-1
+          - eu-central-1
+          - eu-west-1
+          - us-west-2
+          - ap-southeast-2
+      imageTag:
+        type: string
+        description: "Image Tag"
+        required: true
+      patchnumber:
+        description: "Patch number (e.g. rc/v24.1.0.1-ui-qa1)"
+        required: true
+        type: string
+        default: '0'
+      serviceName:
+        type: string
+        description: "Service component tag (e.g. ui)"
+        required: false
+        default: 'ui'
+
+jobs:
+  EnvSetup:
+    uses: HayGroup/kfone-common/.github/workflows/workflow-env-setup-0.0.1.yml@main
+    secrets: inherit
+    with:
+      envFile: './frontend/variables/common.env,./frontend/variables/${{inputs.region}}/${{inputs.environment}}.env'
+      environment: ${{inputs.environment}}
+
+  Deploy:
+    needs: EnvSetup
+    uses: HayGroup/kfone-common/.github/workflows/docker-api-deploy-openshift-0.0.1.yml@main
+    secrets: inherit
+    with:
+      environment: "${{inputs.environment}}"
+      region: "${{inputs.region}}"
+      imageTag: '${{inputs.imageTag}}'
+      imageRepository: '${{ fromjson(needs.EnvSetup.outputs.envars).imageRepository }}'
+      appName: '${{ fromjson(needs.EnvSetup.outputs.envars).appName }}'
+      namespace: '${{ fromjson(needs.EnvSetup.outputs.envars).namespace }}'
+      hostName: '${{ fromjson(needs.EnvSetup.outputs.envars).hostName }}'
+      moduleChartName: '${{ fromjson(needs.EnvSetup.outputs.envars).moduleChartName }}'
+      moduleChartVersion: '${{ fromjson(needs.EnvSetup.outputs.envars).moduleChartVersion }}'
+      cpuLimits: '${{ fromjson(needs.EnvSetup.outputs.envars).cpuLimits }}'
+      cpuRequests: '${{ fromjson(needs.EnvSetup.outputs.envars).cpuRequests }}'
+      memoryLimits: '${{ fromjson(needs.EnvSetup.outputs.envars).memoryLimits }}'
+      memoryRequests: '${{ fromjson(needs.EnvSetup.outputs.envars).memoryRequests }}'
+      livenessProbeScheme: '${{ fromjson(needs.EnvSetup.outputs.envars).livenessProbeScheme }}'
+      readinessProbeScheme: '${{ fromjson(needs.EnvSetup.outputs.envars).readinessProbeScheme }}'
+      livenessProbeInitialDelaySeconds: '${{ fromjson(needs.EnvSetup.outputs.envars).livenessProbeInitialDelaySeconds }}'
+      readinessProbeInitialDelaySeconds: '${{ fromjson(needs.EnvSetup.outputs.envars).readinessProbeInitialDelaySeconds }}'
+      variablesFile: 'frontend/variables/${{inputs.region}}/${{inputs.environment}}.yaml'
+      enableAppConfig: '${{ fromjson(needs.EnvSetup.outputs.envars).enableAppConfig }}'
+      minReplicas: '${{ fromjson(needs.EnvSetup.outputs.envars).minReplicas }}'
+      maxReplicas: '${{ fromjson(needs.EnvSetup.outputs.envars).maxReplicas }}'
+
+  Tagging:
+    name: Deploy Tag
+    needs: [Deploy]
+    if: ${{ inputs.environment == 'qa1' || inputs.environment == 'stg' || inputs.environment == 'prd' || inputs.environment == 'dem' }}
+    uses: HayGroup/kfone-common/.github/workflows/create-deployment-tag-0.0.1.yml@main
+    secrets: inherit
+    with:
+      environment: ${{ inputs.environment }}
+      region: ${{ inputs.region }}
+      patchnumber: ${{ inputs.patchnumber }}
+      serviceName: ${{ inputs.serviceName }}

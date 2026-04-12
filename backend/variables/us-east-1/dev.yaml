@@ -1,0 +1,74 @@
+environmentVariables:
+  # ── LLM API Keys (populated from AWS Secrets Manager) ──
+  OPENAI_API_KEY:
+    secret: true
+    value: ''
+  GEMINI_API_KEY:
+    secret: true
+    value: ''
+
+  # ── PostgreSQL ──
+  DB_HOST:
+    value: ''
+  DB_PORT:
+    value: '5432'
+  DB_NAME:
+    value: 'iam_db'
+  DB_USER:
+    secret: true
+    value: ''
+  DB_PASSWORD:
+    secret: true
+    value: ''
+
+  # ── Downstream Services ──
+  IAM_SERVICE_BASE_URL:
+    value: 'http://localhost:8080/api/v1'
+  CORE_API_BASE_URL:
+    value: ''
+  IAM_API_BASE_URL:
+    value: ''
+
+  # ── Keycloak SSO ──
+  KEYCLOAK_ENABLED:
+    value: 'true'
+  KEYCLOAK_URL:
+    value: ''
+  KEYCLOAK_REALM:
+    value: ''
+  KEYCLOAK_CLIENT_ID:
+    value: 'idp-agent-ui'
+
+  # ── Keycloak Admin Service Account ──
+  KEYCLOAK_ADMIN_CLIENT_ID:
+    secret: true
+    value: ''
+  KEYCLOAK_ADMIN_CLIENT_SECRET:
+    secret: true
+    value: ''
+
+  # ── General ──
+  PYTHONUNBUFFERED:
+    value: '1'
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+    scheme: HTTP
+  initialDelaySeconds: 30
+  timeoutSeconds: 5
+  periodSeconds: 10
+  successThreshold: 1
+  failureThreshold: 5
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+    scheme: HTTP
+  initialDelaySeconds: 20
+  timeoutSeconds: 3
+  periodSeconds: 5
+  successThreshold: 1
+  failureThreshold: 3

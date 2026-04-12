@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, createContext, useContext, useMemo } from "react";
+import { useState, useEffect, useCallback, createContext, useContext, useMemo, useRef } from "react";
 
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
@@ -325,6 +325,25 @@ function apiFetch(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (_accessToken) headers["Authorization"] = `Bearer ${_accessToken}`;
   return fetch(`${API}${path}`, { ...opts, headers });
+}
+
+/** Extract a readable string from a FastAPI error response body. */
+function apiErrorMsg(body, status) {
+  if (!body || typeof body !== "object") return `HTTP ${status}`;
+  // FastAPI wraps downstream text in `detail`; that text may itself be JSON
+  let detail = body.detail;
+  if (typeof detail === "string") {
+    try { detail = JSON.parse(detail); } catch { /* keep as string */ }
+  }
+  if (detail && typeof detail === "object") {
+    if (detail.error_details?.message) {
+      const { message, code } = detail.error_details;
+      return code ? `${message} (code ${code})` : message;
+    }
+    if (detail.message) return detail.message;
+  }
+  if (typeof detail === "string" && detail) return detail;
+  return `HTTP ${status}`;
 }
 
 // ── Domain tag input ──────────────────────────────────────────────────────────
@@ -1509,7 +1528,7 @@ function CertificatesView() {
 // ── OIDC / Keycloak PKCE auth ─────────────────────────────────────────────────
 
 const OIDC = {
-  base:      (import.meta.env.VITE_KEYCLOAK_URL ?? "") + "/protocol/openid-connect",
+  base:      (import.meta.env.VITE_KEYCLOAK_URL ?? "") + "/realms/" + (import.meta.env.VITE_KEYCLOAK_REALM ?? "master") + "/protocol/openid-connect",
   clientId:  import.meta.env.VITE_KEYCLOAK_CLIENT ?? "",
   scope:     "openid email profile",
   redirectUri: () => window.location.origin + "/",
@@ -1692,10 +1711,10 @@ function LoginPage({ error }) {
       }}>
         <div style={{ textAlign: "center", marginBottom: "32px" }}>
           <div style={{ fontSize: "20px", fontWeight: 700, color: C.accent, letterSpacing: "0.12em" }}>
-            ⬡ IDP AGENT
+            ⬡ TALENT SUITE
           </div>
           <div style={{ fontSize: "11px", color: C.textMuted, marginTop: "6px", letterSpacing: "0.06em" }}>
-            Keycloak IDP Management
+            Platform Agent
           </div>
         </div>
 
@@ -1767,263 +1786,1087 @@ function LoginPage({ error }) {
   );
 }
 
-// ── Policy Assistant View ─────────────────────────────────────────────────────
+// ── Client Explorer ───────────────────────────────────────────────────────────
 
-const SUGGESTED_QUESTIONS = [
-  "What resources can a client-admin access?",
-  "What roles does super-admin include?",
-  "What redirect URIs are on the main app client?",
-  "Which users are assigned the agent-admin role?",
-  "What policies are blocking access to the reporting resource?",
-  "What's the difference between client-admin and super-admin?",
-];
-
-const CONFIDENCE_COLOR = (C) => ({
-  high:   C.success,
-  medium: C.warning,
-  low:    C.error,
-});
-
-function PolicyAssistantView({ llmProvider }) {
+function ClientExplorerView() {
   const C = useColors();
   const S = useStyles();
-
-  const [realms, setRealms]         = useState([]);
-  const [realm, setRealm]           = useState("master");
-  const [question, setQuestion]     = useState("");
-  const [history, setHistory]       = useState([]);
+  const [search, setSearch]         = useState("");
+  const [clients, setClients]       = useState([]);
   const [loading, setLoading]       = useState(false);
-  const [realmLoading, setRealmLoading] = useState(true);
+  const [error, setError]           = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+  const [detail, setDetail]         = useState(null);
+  const [detailError, setDetailError] = useState(null);
+  const [products, setProducts]     = useState([]);
+  const [tab, setTab]               = useState("overview");
+  const [initialLoad, setInitialLoad] = useState(true);
 
-  // Load available realms on mount
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await apiFetch("/policy/realms");
-        const data = await res.json();
-        if (data.realms && data.realms.length) {
-          setRealms(data.realms);
-          setRealm(data.realms[0].realm);
-        } else {
-          setRealms([{ realm: "master", displayName: "master" }]);
-        }
-      } catch {
-        setRealms([{ realm: "master", displayName: "master" }]);
-      }
-      setRealmLoading(false);
-    })();
-  }, []);
-
-  const ask = async (q) => {
-    const trimmed = q.trim();
-    if (!trimmed || loading) return;
-    setLoading(true);
-    setQuestion("");
+  const loadClients = async (q = "") => {
+    setLoading(true); setError(null);
     try {
-      const res = await apiFetch("/policy/query", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: trimmed, realm, llm_provider: llmProvider }),
-      });
-      const data = await res.json();
-      setHistory((prev) => [{ ...data, _id: Date.now() }, ...prev]);
-    } catch (err) {
-      setHistory((prev) => [{
-        _id: Date.now(),
-        status: "error",
-        question: trimmed,
-        realm,
-        error: String(err),
-      }, ...prev]);
+      const res = await apiFetch(`/platform/clients?search=${encodeURIComponent(q)}&limit=30`);
+      if (res.ok) {
+        const d = await res.json();
+        setClients(Array.isArray(d) ? d : d.data || d.clients || []);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setError(apiErrorMsg(err, res.status));
+        setClients([]);
+      }
+    } catch (e) {
+      setError(String(e));
+      setClients([]);
     }
     setLoading(false);
+    setInitialLoad(false);
   };
 
-  const onKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(question); }
+  const loadDetail = async (id) => {
+    setDetail(null); setProducts([]); setDetailError(null);
+    try {
+      const [dRes, pRes] = await Promise.all([
+        apiFetch(`/platform/clients/${id}`),
+        apiFetch(`/platform/clients/${id}/products`),
+      ]);
+      if (dRes.ok) setDetail(await dRes.json());
+      else { const e = await dRes.json().catch(() => ({})); setDetailError(apiErrorMsg(e, dRes.status)); }
+      if (pRes.ok) { const p = await pRes.json(); setProducts(Array.isArray(p) ? p : []); }
+    } catch (e) { setDetailError(String(e)); }
   };
+
+  useEffect(() => { loadClients(); }, []);
+
+  const pick = (client) => {
+    const id = client.client_key || client.clientKey || client.id;
+    setSelectedId(id); setTab("overview"); loadDetail(id);
+  };
+
+  const field = (label, val) => val != null && val !== "" ? (
+    <div key={label} style={S.fieldGroup}>
+      <label style={S.label}>{label}</label>
+      <div style={{ fontSize: "13px", color: C.text }}>{String(val)}</div>
+    </div>
+  ) : null;
 
   return (
     <div>
-      {/* ── Header card ── */}
+      {/* Search bar */}
       <div style={S.card}>
-        <div style={S.cardTitle}>◈ Policy Assistant</div>
-        <div style={{ fontSize: "12px", color: C.textMuted, marginBottom: "16px" }}>
-          Ask natural-language questions about Keycloak roles, policies, permissions, and users.
+        <div style={S.cardTitle}>◈ Client Explorer</div>
+        <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
+          <input
+            style={{ ...S.input, flex: 1 }}
+            placeholder="Search by client name…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && loadClients(search)}
+          />
+          <button style={S.btn("primary")} onClick={() => loadClients(search)} disabled={loading}>
+            {loading ? "…" : "Search"}
+          </button>
+          <button style={S.btn("secondary")} onClick={() => { setSearch(""); loadClients(""); }}>
+            Reset
+          </button>
         </div>
 
-        {/* Realm selector */}
-        <div style={{ display: "flex", gap: "12px", alignItems: "center", marginBottom: "16px" }}>
-          <label style={{ fontSize: "11px", color: C.textMuted, whiteSpace: "nowrap" }}>Realm:</label>
-          {realmLoading ? (
-            <span style={{ fontSize: "11px", color: C.textMuted }}>Loading realms…</span>
-          ) : (
+        {loading && <div style={{ fontSize: "12px", color: C.textMuted }}>Loading clients…</div>}
+        {error && (
+          <div style={{ fontSize: "12px", color: C.error, padding: "8px 12px", borderRadius: "4px",
+            backgroundColor: C.error + "18", border: `1px solid ${C.error}44`, marginBottom: "8px" }}>
+            Error: {error}
+          </div>
+        )}
+        {!loading && !error && !initialLoad && clients.length === 0 && (
+          <div style={{ fontSize: "12px", color: C.textMuted }}>No clients found.</div>
+        )}
+
+        {clients.map((c) => {
+          const id = c.client_key || c.clientKey || c.id;
+          const name = c.client_name || c.clientName || c.name || "—";
+          const code = c.client_code || c.clientCode || "";
+          const pams = c.pams_id || c.pamsId || "";
+          return (
+            <div
+              key={id}
+              onClick={() => pick(c)}
+              style={{
+                ...S.idpRow, cursor: "pointer", borderRadius: "4px",
+                paddingLeft: "10px", paddingRight: "10px",
+                backgroundColor: selectedId === id ? C.accentGlow + "18" : "transparent",
+                borderLeft: `2px solid ${selectedId === id ? C.accent : "transparent"}`,
+              }}
+            >
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: "13px", color: C.text, fontWeight: 600 }}>{name}</div>
+                <div style={{ fontSize: "11px", color: C.textMuted, marginTop: "2px" }}>
+                  {[code && `Code: ${code}`, pams && `PAMS: ${pams}`].filter(Boolean).join(" · ") || "—"}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                {c.industry_key && <span style={S.tag(C.accent)}>{c.industry_key}</span>}
+                {c.head_count > 0 && (
+                  <span style={{ fontSize: "11px", color: C.textMuted }}>
+                    {Number(c.head_count).toLocaleString()} emp
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Detail panel */}
+      {selectedId && (
+        <div style={S.card}>
+          {detailError && (
+            <div style={{ fontSize: "12px", color: C.error, padding: "8px 12px", borderRadius: "4px",
+              backgroundColor: C.error + "18", border: `1px solid ${C.error}44`, marginBottom: "12px" }}>
+              Error loading detail: {detailError}
+            </div>
+          )}
+          {!detail && !detailError && (
+            <div style={{ fontSize: "12px", color: C.textMuted }}>Loading details…</div>
+          )}
+          {detail && (
+            <>
+              <div style={{ display: "flex", gap: "8px", marginBottom: "20px" }}>
+                {["overview", "products", "sso"].map((t) => (
+                  <button key={t} style={{ ...S.btn(tab === t ? "primary" : "secondary"), padding: "6px 14px", fontSize: "11px" }}
+                    onClick={() => setTab(t)}>{t.toUpperCase()}</button>
+                ))}
+              </div>
+
+              {tab === "overview" && (
+                <div style={S.grid2}>
+                  {field("Client Name",  detail.client_name  || detail.clientName)}
+                  {field("Client Code",  detail.client_code  || detail.clientCode)}
+                  {field("PAMS ID",      detail.pams_id      || detail.pamsId)}
+                  {field("Industry",     detail.industry_key || detail.industryKey)}
+                  {field("Sector",       detail.sector_key   || detail.sectorKey)}
+                  {field("Head Count",   detail.head_count   || detail.headCount)}
+                  {field("Revenue",      detail.revenue)}
+                  {field("Currency",     detail.currency_key || detail.currencyKey)}
+                  {field("Market Cap",   detail.market_cap   || detail.marketCap)}
+                  {field("Description",  detail.description)}
+                </div>
+              )}
+
+              {tab === "products" && (
+                products.length === 0
+                  ? <div style={{ fontSize: "12px", color: C.textMuted }}>No products found.</div>
+                  : products.map((p, i) => (
+                    <div key={i} style={S.idpRow}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: "13px", color: C.text }}>{p.product_name || p.productName || p.name}</div>
+                        <div style={{ fontSize: "11px", color: C.textMuted }}>{p.offering || p.productType || ""}</div>
+                      </div>
+                      <span style={S.tag(C.accent)}>{p.product_key || p.productKey || ""}</span>
+                    </div>
+                  ))
+              )}
+
+              {tab === "sso" && (
+                <div style={{ fontSize: "12px", color: C.textMuted, lineHeight: "1.8" }}>
+                  To view or edit SSO config for this client, use
+                  <strong style={{ color: C.accent }}> Manage → Get IDP by Domain</strong> and
+                  enter the client's email domain.
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── User Management ───────────────────────────────────────────────────────────
+
+function UserManagementView() {
+  const C = useColors();
+  const S = useStyles();
+  const [email, setEmail]         = useState("");
+  const [userData, setUserData]   = useState(null);
+  const [loading, setLoading]     = useState(false);
+  const [searched, setSearched]   = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  const [actionBusy, setActionBusy] = useState("");
+  const [actionMsg, setActionMsg] = useState(null);
+
+  const searchUser = async () => {
+    const q = email.trim();
+    if (!q) return;
+    setLoading(true); setUserData(null); setActionMsg(null); setSearched(false); setSearchError(null);
+    try {
+      const res = await apiFetch(`/platform/users/search?email=${encodeURIComponent(q)}`);
+      if (res.ok) {
+        const d = await res.json();
+        const u = Array.isArray(d) ? d[0] : (d.data ? (Array.isArray(d.data) ? d.data[0] : d.data) : d);
+        setUserData(u || null);
+        // If we got a user key, fetch full details
+        const uid = u?.user_key || u?.userId || u?.id;
+        if (uid) {
+          const dRes = await apiFetch(`/platform/users/${uid}/details`);
+          if (dRes.ok) setUserData(await dRes.json());
+        }
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setSearchError(apiErrorMsg(err, res.status));
+      }
+    } catch (e) {
+      setSearchError(String(e));
+    }
+    setLoading(false); setSearched(true);
+  };
+
+  const doAction = async (type) => {
+    setActionBusy(type); setActionMsg(null);
+    const uid = userData?.user_key || userData?.userId || userData?.id || "";
+    const userEmail = userData?.email || email;
+    try {
+      let res;
+      if (type === "reset-password") {
+        res = await apiFetch("/platform/users/reset-password", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: userEmail }),
+        });
+      } else if (type === "magic-link") {
+        res = await apiFetch("/platform/users/magic-link", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: userEmail, user_id: uid, redirect_url: "" }),
+        });
+      } else if (type === "lock" || type === "unlock") {
+        res = await apiFetch("/platform/users/lock", {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: type, user_keys: [uid] }),
+        });
+      } else if (type === "activate" || type === "deactivate") {
+        res = await apiFetch("/platform/users/status", {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: type === "activate" ? "active" : "inactive", user_keys: [uid] }),
+        });
+      }
+      const ok = res?.ok ?? false;
+      const body = ok ? (await res.json().catch(() => ({}))) : {};
+      setActionMsg({ type, ok, body });
+    } catch (e) {
+      setActionMsg({ type, ok: false, body: { error: String(e) } });
+    }
+    setActionBusy("");
+  };
+
+  const Badge = ({ label, positive }) => (
+    <span style={{
+      padding: "2px 8px", borderRadius: "10px", fontSize: "10px", fontWeight: 700,
+      textTransform: "uppercase", letterSpacing: "0.05em",
+      background: (positive ? C.success : C.error) + "22",
+      border: `1px solid ${(positive ? C.success : C.error)}44`,
+      color: positive ? C.success : C.error,
+    }}>{label}</span>
+  );
+
+  const ACTIONS = [
+    { id: "reset-password", label: "Reset Password", v: "secondary" },
+    { id: "magic-link",     label: "Magic Link",     v: "secondary" },
+    { id: "unlock",         label: "Unlock",         v: "secondary" },
+    { id: "lock",           label: "Lock",           v: "danger"    },
+    { id: "activate",       label: "Activate",       v: "secondary" },
+    { id: "deactivate",     label: "Deactivate",     v: "danger"    },
+  ];
+
+  return (
+    <div>
+      <div style={S.card}>
+        <div style={S.cardTitle}>◈ User Management</div>
+        <div style={{ display: "flex", gap: "8px", marginBottom: "20px" }}>
+          <input
+            style={{ ...S.input, flex: 1 }}
+            placeholder="Search by email address…"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && searchUser()}
+          />
+          <button style={S.btn("primary")} onClick={searchUser} disabled={loading}>
+            {loading ? "Searching…" : "Search"}
+          </button>
+        </div>
+
+        {searchError && (
+          <div style={{ fontSize: "12px", color: C.error, padding: "8px 12px", borderRadius: "4px",
+            backgroundColor: C.error + "18", border: `1px solid ${C.error}44`, marginBottom: "8px" }}>
+            Error: {searchError}
+          </div>
+        )}
+        {searched && !userData && !searchError && (
+          <div style={{ fontSize: "12px", color: C.textMuted }}>No user found for "{email}".</div>
+        )}
+
+        {userData && (
+          <>
+            {/* User card */}
+            <div style={{
+              backgroundColor: C.surfaceAlt, border: `1px solid ${C.border}`,
+              borderRadius: "6px", padding: "16px 20px", marginBottom: "16px",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "10px" }}>
+                <div>
+                  <div style={{ fontSize: "15px", fontWeight: 700, color: C.text }}>
+                    {userData.name || `${userData.first_name || ""} ${userData.last_name || ""}`.trim() || "—"}
+                  </div>
+                  <div style={{ fontSize: "12px", color: C.textMuted, marginTop: "2px" }}>{userData.email}</div>
+                  {userData.department && (
+                    <div style={{ fontSize: "11px", color: C.textDim, marginTop: "2px" }}>{userData.department}</div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  {userData.status && (
+                    <Badge label={userData.status} positive={userData.status === "active"} />
+                  )}
+                  {userData.isLocked !== undefined && (
+                    <Badge label={userData.isLocked ? "locked" : "unlocked"} positive={!userData.isLocked} />
+                  )}
+                </div>
+              </div>
+
+              {userData.roles?.length > 0 && (
+                <div style={{ marginBottom: "8px" }}>
+                  <div style={S.label}>Roles</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", marginTop: "4px" }}>
+                    {userData.roles.map((r, i) => (
+                      <span key={i} style={S.tag(C.accent)}>
+                        {typeof r === "string" ? r : r.roleName || r.role_name || r.name || JSON.stringify(r)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {userData.teams?.length > 0 && (
+                <div>
+                  <div style={S.label}>Teams</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", marginTop: "4px" }}>
+                    {userData.teams.map((t, i) => (
+                      <span key={i} style={S.tag(C.textDim)}>
+                        {typeof t === "string" ? t : t.teamName || t.group_name || t.name || JSON.stringify(t)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Action buttons */}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "12px" }}>
+              {ACTIONS.map(({ id, label, v }) => (
+                <button
+                  key={id}
+                  style={{ ...S.btn(v), padding: "8px 14px", fontSize: "11px", opacity: actionBusy ? 0.6 : 1 }}
+                  onClick={() => doAction(id)}
+                  disabled={!!actionBusy}
+                >
+                  {actionBusy === id ? "…" : label}
+                </button>
+              ))}
+            </div>
+
+            {actionMsg && (
+              <div style={{
+                padding: "10px 14px", borderRadius: "4px", fontSize: "12px",
+                backgroundColor: (actionMsg.ok ? C.success : C.error) + "18",
+                border: `1px solid ${actionMsg.ok ? C.success : C.error}44`,
+                color: actionMsg.ok ? C.success : C.error,
+              }}>
+                {actionMsg.ok
+                  ? `${actionMsg.type} completed.`
+                  : `Failed: ${actionMsg.body?.detail || actionMsg.body?.error || "Unknown error"}`}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// ── Unified Chat helpers ──────────────────────────────────────────────────────
+
+// Map tool names → which service they belong to
+function sourceService(toolName) {
+  if (toolName.startsWith("keycloak_")) return "keycloak";
+  if (toolName.startsWith("iam_"))      return "iam";
+  if (toolName.startsWith("core_"))     return "core";
+  return "other";
+}
+
+function sourceColor(C, service) {
+  if (service === "keycloak") return C.accent;
+  if (service === "iam")      return C.success;
+  if (service === "core")     return C.warning;
+  return C.textMuted;
+}
+
+// Deduplicate to one badge per service
+function uniqueServiceSources(sources) {
+  const seen = new Set();
+  return (sources || []).filter((s) => {
+    const svc = sourceService(s);
+    if (seen.has(svc)) return false;
+    seen.add(svc);
+    return true;
+  });
+}
+
+const CHAT_SUGGESTIONS = [
+  { text: "What roles exist in this realm?",          svc: "keycloak" },
+  { text: "Who has the agent-admin role?",            svc: "keycloak" },
+  { text: "Show authorization policies for a client", svc: "keycloak" },
+  { text: "Find user john@acmecorp.com",              svc: "iam"      },
+  { text: "List all IAM platform roles",              svc: "iam"      },
+  { text: "Show all communities",                     svc: "iam"      },
+  { text: "Search for client Acme",                   svc: "core"     },
+  { text: "What's the login mode for acmecorp.com?",  svc: "core"     },
+  { text: "Show SSO config for acmecorp.com",         svc: "core"     },
+];
+
+// ── Markdown renderer for assistant messages ─────────────────────────────────
+
+// Renders **bold** and `code` spans inline
+function renderInlineMd(text) {
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**"))
+      return <strong key={i}>{part.slice(2, -2)}</strong>;
+    if (part.startsWith("`") && part.endsWith("`"))
+      return (
+        <code key={i} style={{
+          fontSize: "11px", padding: "1px 5px", borderRadius: "3px",
+          background: "rgba(128,128,128,0.15)", fontFamily: "monospace",
+        }}>
+          {part.slice(1, -1)}
+        </code>
+      );
+    return part;
+  });
+}
+
+// Renders a comma-separated value as small tag chips when count > 3
+function TagChips({ value, C }) {
+  const tags = value.split(",").map((t) => t.trim()).filter(Boolean);
+  if (tags.length <= 3) return <span style={{ wordBreak: "break-word" }}>{value}</span>;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", marginTop: "3px" }}>
+      {tags.map((tag, i) => (
+        <span key={i} style={{
+          padding: "2px 7px", borderRadius: "3px", fontSize: "10px",
+          background: C.surfaceAlt, border: `1px solid ${C.border}`,
+          color: C.textDim, whiteSpace: "nowrap",
+        }}>
+          {tag}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// Parses markdown into key-value tables, bullet lists, headings, and plain text
+function MarkdownMessage({ text, C }) {
+  const lines = text.split("\n");
+  const segments = [];
+  let kvBuffer = [];
+
+  const flushKv = () => {
+    if (kvBuffer.length > 0) {
+      segments.push({ type: "kv", items: [...kvBuffer] });
+      kvBuffer = [];
+    }
+  };
+
+  for (const line of lines) {
+    // * **Key:** Value  or  - **Key:** Value  (bullet kv)
+    const kvBullet = line.match(/^[\*\-]\s+\*\*([^:*]+):\*\*\s*(.*)$/);
+    if (kvBullet) {
+      kvBuffer.push({ key: kvBullet[1].trim(), value: kvBullet[2].trim() });
+      continue;
+    }
+    // **Key:** Value  (standalone kv, no bullet)
+    const kvPlain = line.match(/^\*\*([^:*]+):\*\*\s+(.+)$/);
+    if (kvPlain) {
+      kvBuffer.push({ key: kvPlain[1].trim(), value: kvPlain[2].trim() });
+      continue;
+    }
+
+    flushKv();
+
+    if (line.trim() === "") { segments.push({ type: "br" }); continue; }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) { segments.push({ type: "heading", level: heading[1].length, content: heading[2] }); continue; }
+
+    const bullet = line.match(/^[\*\-]\s+(.+)$/);
+    if (bullet) { segments.push({ type: "bullet", content: bullet[1] }); continue; }
+
+    segments.push({ type: "text", content: line });
+  }
+  flushKv();
+
+  return (
+    <div style={{ fontSize: "13px", lineHeight: "1.65" }}>
+      {segments.map((seg, i) => {
+        if (seg.type === "kv") {
+          return (
+            <table key={i} style={{
+              borderCollapse: "collapse", width: "100%", margin: "6px 0 10px", fontSize: "12px",
+            }}>
+              <tbody>
+                {seg.items.map((item, j) => (
+                  <tr key={j} style={{ borderBottom: `1px solid ${C.border}` }}>
+                    <td style={{
+                      padding: "5px 14px 5px 0", fontWeight: 700, color: C.textMuted,
+                      whiteSpace: "nowrap", verticalAlign: "top",
+                      fontSize: "11px", textTransform: "uppercase",
+                      letterSpacing: "0.05em", minWidth: "100px",
+                    }}>
+                      {item.key}
+                    </td>
+                    <td style={{ padding: "5px 0", verticalAlign: "top", wordBreak: "break-word" }}>
+                      {item.value.includes(",") && item.value.split(",").length > 3
+                        ? <TagChips value={item.value} C={C} />
+                        : <span>{renderInlineMd(item.value)}</span>
+                      }
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          );
+        }
+        if (seg.type === "br")
+          return <div key={i} style={{ height: "6px" }} />;
+        if (seg.type === "heading") {
+          return (
+            <div key={i} style={{
+              fontWeight: 700, color: C.accent, fontSize: seg.level === 1 ? "13px" : "12px",
+              textTransform: "uppercase", letterSpacing: "0.08em", margin: "8px 0 4px",
+            }}>
+              {seg.content}
+            </div>
+          );
+        }
+        if (seg.type === "bullet") {
+          return (
+            <div key={i} style={{ display: "flex", gap: "8px", marginBottom: "3px", alignItems: "flex-start" }}>
+              <span style={{ color: C.accent, flexShrink: 0, lineHeight: "1.65" }}>·</span>
+              <span style={{ wordBreak: "break-word" }}>{renderInlineMd(seg.content)}</span>
+            </div>
+          );
+        }
+        return (
+          <div key={i} style={{ marginBottom: "2px", wordBreak: "break-word" }}>
+            {renderInlineMd(seg.content)}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Unified Chat View ────────────────────────────────────────────────────────
+
+function UnifiedChatView({ llmProvider, user }) {
+  const C = useColors();
+  const S = useStyles();
+
+  const defaultRealm = import.meta.env.VITE_KEYCLOAK_REALM || "master";
+  const [realm, setRealm]           = useState(defaultRealm);
+  const [realms, setRealms]         = useState([{ realm: defaultRealm, displayName: defaultRealm }]);
+
+  const [sessions, setSessions]     = useState([]);
+  const [activeSession, setActive]  = useState(null);
+  const [messages, setMessages]     = useState([]);
+  const [input, setInput]           = useState("");
+
+  const [loadingSessions, setLoadingSessions] = useState(true);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [sending, setSending]       = useState(false);
+
+  const bottomRef = useRef(null);
+
+  // Load available Keycloak realms for the realm selector
+  useEffect(() => {
+    apiFetch("/policy/realms")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.realms?.length) {
+          setRealms(d.realms);
+          const pref = d.realms.find((r) => r.realm === defaultRealm);
+          setRealm((pref ?? d.realms[0]).realm);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Load session list on mount
+  useEffect(() => {
+    apiFetch("/chat/sessions")
+      .then((r) => r.ok ? r.json() : [])
+      .then(setSessions)
+      .catch(() => {})
+      .finally(() => setLoadingSessions(false));
+  }, []);
+
+  // Load messages when active session changes
+  useEffect(() => {
+    if (!activeSession) { setMessages([]); return; }
+    setLoadingMessages(true);
+    apiFetch(`/chat/sessions/${activeSession}`)
+      .then((r) => r.ok ? r.json() : { messages: [] })
+      .then((d) => setMessages(d.messages || []))
+      .catch(() => {})
+      .finally(() => setLoadingMessages(false));
+  }, [activeSession]);
+
+  // Auto-scroll to the latest message
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, sending]);
+
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+    setSending(true);
+    setInput("");
+
+    const optimistic = { role: "user", message: text, created_at: new Date().toISOString() };
+    setMessages((prev) => [...prev, optimistic]);
+
+    try {
+      const res = await apiFetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          llm_provider: llmProvider,
+          realm,
+          session_id: activeSession || undefined,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (!activeSession) {
+          const preview = text.length > 60 ? text.slice(0, 57) + "..." : text;
+          setSessions((prev) => [{
+            session_id: data.session_id,
+            first_message: preview,
+            created_at: new Date().toISOString(),
+            message_count: 1,
+          }, ...prev]);
+          setActive(data.session_id);
+        }
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          message: data.reply || "",
+          created_at: new Date().toISOString(),
+          sources: data.sources || [],
+          token_usage: data.token_usage || null,
+        }]);
+      } else {
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          message: "Error: could not reach the server.",
+          created_at: new Date().toISOString(),
+        }]);
+      }
+    } catch (err) {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        message: `Error: ${err}`,
+        created_at: new Date().toISOString(),
+      }]);
+    }
+    setSending(false);
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  };
+
+  const startNew = () => { setActive(null); setMessages([]); };
+
+  const fmtTime = (iso) => {
+    if (!iso) return "";
+    try {
+      return new Date(iso).toLocaleString(undefined, {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+      });
+    } catch { return iso; }
+  };
+
+  return (
+    <div style={{ display: "flex", gap: "20px", height: "calc(100vh - 140px)" }}>
+
+      {/* Session list */}
+      <div style={{
+        width: "240px", flexShrink: 0,
+        backgroundColor: C.surface, border: `1px solid ${C.border}`,
+        borderRadius: "8px", display: "flex", flexDirection: "column", overflow: "hidden",
+      }}>
+        <div style={{
+          padding: "14px 16px", borderBottom: `1px solid ${C.border}`,
+          fontSize: "11px", fontWeight: 700, color: C.accent,
+          textTransform: "uppercase", letterSpacing: "0.1em",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+        }}>
+          Sessions
+          <button
+            onClick={startNew}
+            style={{
+              background: C.accent + "22", border: `1px solid ${C.accent}44`,
+              color: C.accent, borderRadius: "4px", padding: "3px 8px",
+              fontSize: "10px", cursor: "pointer", fontFamily: "inherit",
+              fontWeight: 700, letterSpacing: "0.05em",
+            }}
+          >
+            + New
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {loadingSessions ? (
+            <div style={{ padding: "16px", fontSize: "11px", color: C.textMuted }}>Loading...</div>
+          ) : sessions.length === 0 ? (
+            <div style={{ padding: "16px", fontSize: "11px", color: C.textMuted, lineHeight: "1.6" }}>
+              No conversations yet. Type a message to start one.
+            </div>
+          ) : sessions.map((s) => (
+            <div
+              key={s.session_id}
+              onClick={() => setActive(s.session_id)}
+              style={{
+                padding: "12px 16px", borderBottom: `1px solid ${C.border}`,
+                cursor: "pointer",
+                backgroundColor: activeSession === s.session_id ? C.accentGlow + "22" : "transparent",
+                borderLeft: `2px solid ${activeSession === s.session_id ? C.accent : "transparent"}`,
+                transition: "all 0.15s",
+              }}
+            >
+              <div style={{
+                fontSize: "11px", color: activeSession === s.session_id ? C.text : C.textDim,
+                marginBottom: "4px", overflow: "hidden", textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}>
+                {s.first_message || "—"}
+              </div>
+              <div style={{ fontSize: "10px", color: C.textMuted }}>
+                {fmtTime(s.created_at)}
+                {s.message_count > 0 && (
+                  <span style={{ marginLeft: "6px" }}>
+                    · {s.message_count} msg{s.message_count !== 1 ? "s" : ""}
+                  </span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Chat panel */}
+      <div style={{
+        flex: 1, display: "flex", flexDirection: "column",
+        backgroundColor: C.surface, border: `1px solid ${C.border}`,
+        borderRadius: "8px", overflow: "hidden",
+      }}>
+
+        {/* Header with realm selector */}
+        <div style={{
+          padding: "12px 20px", borderBottom: `1px solid ${C.border}`,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          gap: "12px", flexShrink: 0,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <span style={{
+              fontWeight: 700, color: C.accent, textTransform: "uppercase",
+              letterSpacing: "0.1em", fontSize: "11px",
+            }}>
+              Platform Assistant
+            </span>
+            <span style={{ fontSize: "10px", color: C.textMuted }}>
+              Keycloak · IAM · Core
+              {activeSession && ` · ${activeSession.slice(0, 8)}...`}
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <span style={{ fontSize: "10px", color: C.textMuted }}>Realm:</span>
             <select
               value={realm}
               onChange={(e) => setRealm(e.target.value)}
               style={{
                 background: C.surfaceAlt, color: C.text, border: `1px solid ${C.border}`,
-                borderRadius: "4px", padding: "6px 10px", fontSize: "12px", fontFamily: "inherit",
+                borderRadius: "4px", padding: "3px 8px", fontSize: "11px",
+                fontFamily: "inherit", cursor: "pointer", outline: "none",
               }}
             >
               {realms.map((r) => (
                 <option key={r.realm} value={r.realm}>{r.displayName || r.realm}</option>
               ))}
             </select>
-          )}
+          </div>
         </div>
 
-        {/* Question input */}
-        <div style={{ display: "flex", gap: "8px" }}>
+        {/* Messages */}
+        <div style={{
+          flex: 1, overflowY: "auto", padding: "20px",
+          display: "flex", flexDirection: "column", gap: "14px",
+        }}>
+          {loadingMessages ? (
+            <div style={{ fontSize: "12px", color: C.textMuted, textAlign: "center", marginTop: "40px" }}>
+              Loading...
+            </div>
+          ) : messages.length === 0 ? (
+            <div style={{ textAlign: "center", marginTop: "40px" }}>
+              <div style={{ fontSize: "24px", marginBottom: "12px" }}>&#11041;</div>
+              <div style={{ fontSize: "12px", color: C.textMuted, lineHeight: "1.8", marginBottom: "24px" }}>
+                Ask anything about Keycloak, IAM users, or Core platform clients.
+              </div>
+              <div style={{
+                display: "flex", flexWrap: "wrap", gap: "6px",
+                justifyContent: "center", maxWidth: "600px", margin: "0 auto",
+              }}>
+                {CHAT_SUGGESTIONS.map((s) => {
+                  const col = sourceColor(C, s.svc);
+                  return (
+                    <button
+                      key={s.text}
+                      onClick={() => setInput(s.text)}
+                      style={{
+                        padding: "5px 12px", fontSize: "11px", borderRadius: "12px",
+                        border: `1px solid ${col}44`, background: col + "18",
+                        color: col, cursor: "pointer", fontFamily: "inherit",
+                        transition: "all 0.15s",
+                      }}
+                    >
+                      {s.text}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            messages.map((m, i) => {
+              const isUser   = m.role === "user";
+              const dedupSrc = isUser ? [] : uniqueServiceSources(m.sources);
+              return (
+                <div
+                  key={i}
+                  style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}
+                >
+                  <div style={{
+                    maxWidth: "78%", padding: "10px 14px",
+                    borderRadius: isUser ? "12px 12px 2px 12px" : "12px 12px 12px 2px",
+                    fontSize: "13px", lineHeight: "1.65",
+                    backgroundColor: isUser ? C.accent + "22" : C.surfaceAlt,
+                    border: `1px solid ${isUser ? C.accent + "44" : C.border}`,
+                    color: C.text, whiteSpace: isUser ? "pre-wrap" : undefined, wordBreak: "break-word",
+                  }}>
+                    {isUser ? m.message : <MarkdownMessage text={m.message} C={C} />}
+                    <div style={{
+                      fontSize: "10px", color: C.textMuted,
+                      marginTop: "6px", textAlign: isUser ? "right" : "left",
+                    }}>
+                      {isUser ? (user?.name || user?.email || "you") : "assistant"} · {fmtTime(m.created_at)}
+                    </div>
+                  </div>
+
+                  {/* Service source badges */}
+                  {!isUser && (dedupSrc.length > 0 || m.token_usage) && (
+                    <div style={{
+                      display: "flex", alignItems: "center", flexWrap: "wrap",
+                      gap: "5px", marginTop: "4px", maxWidth: "78%",
+                    }}>
+                      {dedupSrc.map((src) => {
+                        const svc = sourceService(src);
+                        const col = sourceColor(C, svc);
+                        return (
+                          <span key={src} style={{
+                            padding: "2px 7px", borderRadius: "10px", fontSize: "10px",
+                            background: col + "18", border: `1px solid ${col}44`, color: col,
+                            fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                          }}>
+                            {svc}
+                          </span>
+                        );
+                      })}
+                      {m.token_usage && (
+                        <span style={{ fontSize: "10px", color: C.textMuted }}>
+                          {m.token_usage.total_tokens ?? 0} tokens
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+
+          {sending && (
+            <div style={{ display: "flex", justifyContent: "flex-start" }}>
+              <div style={{
+                padding: "10px 16px", borderRadius: "12px 12px 12px 2px",
+                backgroundColor: C.surfaceAlt, border: `1px solid ${C.border}`,
+                fontSize: "13px", color: C.textMuted,
+              }}>
+                ...
+              </div>
+            </div>
+          )}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Input area */}
+        <div style={{
+          padding: "12px 16px", borderTop: `1px solid ${C.border}`,
+          display: "flex", gap: "8px", alignItems: "flex-end", flexShrink: 0,
+        }}>
           <textarea
             rows={2}
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="Ask about roles, policies, permissions, or users…"
+            placeholder="Ask about Keycloak roles, IAM users, Core clients... (Enter to send, Shift+Enter for newline)"
             style={{
               flex: 1, background: C.surfaceAlt, color: C.text,
-              border: `1px solid ${C.border}`, borderRadius: "4px",
-              padding: "10px 12px", fontSize: "12px", fontFamily: "inherit",
-              resize: "vertical",
+              border: `1px solid ${C.border}`, borderRadius: "6px",
+              padding: "10px 12px", fontSize: "13px", fontFamily: "inherit",
+              resize: "none", outline: "none",
             }}
           />
           <button
-            onClick={() => ask(question)}
-            disabled={loading || !question.trim()}
+            onClick={sendMessage}
+            disabled={sending || !input.trim()}
             style={{
               ...S.btn("primary"),
+              opacity: sending || !input.trim() ? 0.5 : 1,
               alignSelf: "flex-end",
-              opacity: loading || !question.trim() ? 0.5 : 1,
+              padding: "10px 18px",
             }}
           >
-            {loading ? "…" : "Ask →"}
+            {sending ? "..." : "Send ->"}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
 
-        {/* Suggested question chips */}
-        <div style={{ marginTop: "12px", display: "flex", flexWrap: "wrap", gap: "6px" }}>
-          {SUGGESTED_QUESTIONS.map((sq) => (
-            <button
-              key={sq}
-              onClick={() => ask(sq)}
-              disabled={loading}
-              style={{
-                padding: "4px 10px", fontSize: "11px", borderRadius: "12px",
-                border: `1px solid ${C.border}`, background: "transparent",
-                color: C.textDim, cursor: loading ? "not-allowed" : "pointer",
-                fontFamily: "inherit", transition: "all 0.15s",
-                opacity: loading ? 0.5 : 1,
-              }}
-            >
-              {sq}
-            </button>
-          ))}
+// ── Token Setup View ──────────────────────────────────────────────────────────
+
+function TokenSetupView() {
+  const C = useColors();
+  const S = useStyles();
+
+  const defaultRealm  = import.meta.env.VITE_KEYCLOAK_REALM  ?? "";
+  const defaultClient = import.meta.env.VITE_KEYCLOAK_CLIENT ?? "";
+
+  const [realm,         setRealm]         = useState(defaultRealm);
+  const [clientId,      setClientId]      = useState(defaultClient);
+  const [attributeName, setAttributeName] = useState("userId");
+  const [claimName,     setClaimName]     = useState("userId");
+  const [status,        setStatus]        = useState(null);   // null | {exists,mapper} | {created,mapper}
+  const [error,         setError]         = useState(null);
+  const [busy,          setBusy]          = useState(false);
+
+  const check = async () => {
+    setBusy(true); setStatus(null); setError(null);
+    try {
+      const res = await apiFetch(
+        `/admin/userid-mapper?realm=${encodeURIComponent(realm)}&client_id=${encodeURIComponent(clientId)}&claim_name=${encodeURIComponent(claimName)}`
+      );
+      if (res.ok) setStatus(await res.json());
+      else { const e = await res.json().catch(() => ({})); setError(apiErrorMsg(e, res.status)); }
+    } catch (e) { setError(String(e)); }
+    setBusy(false);
+  };
+
+  const setup = async () => {
+    setBusy(true); setStatus(null); setError(null);
+    try {
+      const params = new URLSearchParams({
+        realm,
+        client_id:      clientId,
+        attribute_name: attributeName,
+        claim_name:     claimName,
+      });
+      const res = await apiFetch(`/admin/userid-mapper?${params}`, { method: "POST" });
+      if (res.ok) setStatus(await res.json());
+      else { const e = await res.json().catch(() => ({})); setError(apiErrorMsg(e, res.status)); }
+    } catch (e) { setError(String(e)); }
+    setBusy(false);
+  };
+
+  const mapperExists = status?.exists === true || status?.created === false;
+  const justCreated  = status?.created === true;
+
+  return (
+    <div style={S.card}>
+      <div style={S.cardTitle}>Token Claim Setup — userId</div>
+      <p style={{ fontSize: "12px", color: C.textMuted, margin: "0 0 20px" }}>
+        The Core API requires a <code style={{ background: C.surfaceAlt, padding: "1px 5px", borderRadius: "3px" }}>userId</code> claim
+        in the Keycloak access token. Use this panel to add the protocol mapper to your OIDC client.
+        Each user must also have a <code style={{ background: C.surfaceAlt, padding: "1px 5px", borderRadius: "3px" }}>userId</code> attribute
+        set on their Keycloak profile.
+      </p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "12px" }}>
+        <div style={S.fieldGroup}>
+          <label style={S.label}>Realm</label>
+          <input style={S.input} value={realm} onChange={(e) => setRealm(e.target.value)} placeholder="master" />
+        </div>
+        <div style={S.fieldGroup}>
+          <label style={S.label}>Client ID</label>
+          <input style={S.input} value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="your-client-id" />
+        </div>
+        <div style={S.fieldGroup}>
+          <label style={S.label}>Keycloak User Attribute</label>
+          <input style={S.input} value={attributeName} onChange={(e) => setAttributeName(e.target.value)} placeholder="userId" />
+        </div>
+        <div style={S.fieldGroup}>
+          <label style={S.label}>JWT Claim Name</label>
+          <input style={S.input} value={claimName} onChange={(e) => setClaimName(e.target.value)} placeholder="userId" />
         </div>
       </div>
 
-      {/* ── Answer history (newest at top) ── */}
-      {history.map((entry) => (
-        <div key={entry._id} style={{ ...S.card, marginTop: "12px" }}>
-          {/* Question header */}
-          <div style={{
-            fontSize: "12px", color: C.textMuted, marginBottom: "10px",
-            paddingBottom: "8px", borderBottom: `1px solid ${C.border}`,
-          }}>
-            <span style={{ color: C.accent, marginRight: "6px" }}>Q:</span>
-            {entry.question}
-            <span style={{
-              marginLeft: "10px", fontSize: "10px", color: C.textMuted,
-            }}>— realm: {entry.realm}</span>
-          </div>
+      <div style={{ display: "flex", gap: "10px", marginBottom: "16px" }}>
+        <button style={S.btn("secondary")} onClick={check} disabled={busy || !realm || !clientId}>
+          {busy ? "Checking…" : "Check Status"}
+        </button>
+        <button style={S.btn("primary")} onClick={setup} disabled={busy || !realm || !clientId}>
+          {busy ? "Setting up…" : "Setup Mapper"}
+        </button>
+      </div>
 
-          {/* Error state */}
-          {entry.status === "error" && (
-            <div style={{
-              background: C.error + "18", border: `1px solid ${C.error}`,
-              borderRadius: "4px", padding: "10px 14px",
-              color: C.error, fontSize: "12px",
-            }}>
-              {entry.error}
-            </div>
-          )}
-
-          {/* Success state */}
-          {entry.status === "success" && entry.answer && (() => {
-            const ans = entry.answer;
-            const confColor = (CONFIDENCE_COLOR(C))[ans.confidence] || C.textMuted;
-            return (
-              <>
-                {/* Direct answer highlight */}
-                <div style={{
-                  background: C.accent + "18", border: `1px solid ${C.accent}40`,
-                  borderRadius: "4px", padding: "10px 14px", marginBottom: "10px",
-                  fontSize: "13px", lineHeight: "1.6", color: C.text,
-                }}>
-                  {ans.answer}
-                </div>
-
-                {/* Details */}
-                {ans.details && (
-                  <div style={{ fontSize: "12px", color: C.textDim, lineHeight: "1.7", marginBottom: "10px" }}>
-                    {ans.details}
-                  </div>
-                )}
-
-                {/* Sources + confidence row */}
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
-                  {(ans.sources || []).map((src, i) => (
-                    <span key={i} style={{
-                      padding: "2px 8px", borderRadius: "10px", fontSize: "10px",
-                      background: C.surfaceAlt, border: `1px solid ${C.border}`, color: C.textDim,
-                    }}>
-                      {src}
-                    </span>
-                  ))}
-                  <span style={{
-                    padding: "2px 8px", borderRadius: "10px", fontSize: "10px",
-                    background: confColor + "22", border: `1px solid ${confColor}`,
-                    color: confColor, fontWeight: 600, textTransform: "uppercase",
-                    letterSpacing: "0.05em",
-                  }}>
-                    {ans.confidence}
-                  </span>
-                </div>
-
-                {/* Missing data hint */}
-                {ans.missing_data && ans.missing_data !== "None" && (
-                  <div style={{
-                    fontSize: "11px", color: C.warning,
-                    marginBottom: "8px", padding: "6px 10px",
-                    background: C.warning + "12", borderRadius: "4px",
-                    border: `1px solid ${C.warning}40`,
-                  }}>
-                    Missing data: {ans.missing_data}
-                  </div>
-                )}
-
-                {/* Token usage footer */}
-                {entry.token_usage && (
-                  <div style={{ fontSize: "10px", color: C.textMuted, borderTop: `1px solid ${C.border}`, paddingTop: "6px", marginTop: "4px" }}>
-                    {entry.token_usage.prompt_tokens ?? 0} prompt + {entry.token_usage.completion_tokens ?? 0} completion
-                    = {entry.token_usage.total_tokens ?? 0} tokens
-                    &nbsp;·&nbsp;
-                    context: {(entry.context_sources || []).join(", ") || "—"}
-                  </div>
-                )}
-              </>
-            );
-          })()}
+      {error && (
+        <div style={{ fontSize: "12px", color: C.error, background: C.error + "18",
+          border: `1px solid ${C.error}44`, borderRadius: "4px", padding: "10px 14px" }}>
+          {error}
         </div>
-      ))}
+      )}
 
-      {/* Empty state */}
-      {!loading && history.length === 0 && (
-        <div style={{
-          textAlign: "center", color: C.textMuted, fontSize: "12px",
-          marginTop: "32px", lineHeight: "2",
-        }}>
-          No questions asked yet. Try one of the suggestions above.
+      {status && (
+        <div style={{ fontSize: "12px", borderRadius: "4px", padding: "10px 14px",
+          color:       justCreated  ? C.success : mapperExists ? C.success : C.warning,
+          background:  justCreated  ? C.success + "18" : mapperExists ? C.success + "18" : C.warning + "18",
+          border: `1px solid ${justCreated || mapperExists ? C.success : C.warning}44` }}>
+          {justCreated  && "Mapper created successfully. New tokens will include the userId claim."}
+          {mapperExists && !justCreated && "Mapper already exists — no changes made."}
+          {!justCreated && !mapperExists && !status.exists && "Mapper not found. Click Setup Mapper to create it."}
+          {status.mapper && (
+            <pre style={{ marginTop: "8px", fontSize: "10px", color: C.textMuted,
+              background: C.surfaceAlt, padding: "8px", borderRadius: "4px", overflow: "auto" }}>
+              {JSON.stringify(status.mapper, null, 2)}
+            </pre>
+          )}
         </div>
       )}
     </div>
@@ -2033,7 +2876,7 @@ function PolicyAssistantView({ llmProvider }) {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [view, setView]         = useState("onboard");
+  const [view, setView]         = useState("clients");
   const [llmProvider, setLlm]   = useState("gemini");
   const [theme, setTheme]        = useState("dark");
   const auth                     = useOidcAuth();
@@ -2073,13 +2916,16 @@ export default function App() {
   const isAdmin = user?.roles?.includes("agent-admin") ?? true;
 
   const navItems = [
-    { id: "get-idp",      label: "Get IDP by Domain", section: "Manage"       },
+    { id: "clients",      label: "Client Explorer",    section: "Platform"     },
+    { id: "users",        label: "User Management",    section: "Platform"     },
+    { id: "get-idp",      label: "Get IDP by Domain",  section: "Manage"       },
     { id: "my-idp",       label: "Add My IDP",         section: "Manage"       },
+    { id: "onboard",      label: "Onboard New IDP",    section: "Manage",      adminOnly: true },
+    { id: "update",       label: "Update IDP",         section: "Manage",      adminOnly: true },
+    { id: "token-setup",  label: "Token Claim Setup",  section: "Admin",       adminOnly: true },
     { id: "usage",        label: "Token Usage",        section: "Observe"      },
     { id: "certificates", label: "Certificates",       section: "Observe"      },
-    { id: "onboard",      label: "Onboard New IDP",    section: "Actions",     adminOnly: true },
-    { id: "update",       label: "Update IDP",         section: "Actions",     adminOnly: true },
-    { id: "policy",       label: "Policy Assistant",   section: "Intelligence" },
+    { id: "assistant",    label: "Platform Assistant", section: "Intelligence" },
   ].filter((n) => !n.adminOnly || isAdmin);
 
   const sections = [...new Set(navItems.map((n) => n.section))];
@@ -2089,8 +2935,8 @@ export default function App() {
       <div style={S.app}>
         <header style={S.header}>
           <div>
-            <div style={S.headerTitle}>⬡ Keycloak IDP Agent</div>
-            <div style={S.headerSub}>Agentic IDP Onboarding &amp; Management</div>
+            <div style={S.headerTitle}>⬡ Talent Suite Platform Agent</div>
+            <div style={S.headerSub}>Platform Intelligence &amp; Management</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
             <LLMSelector value={llmProvider} onChange={setLlm} />
@@ -2125,13 +2971,16 @@ export default function App() {
           </nav>
 
           <main style={S.content}>
+            {view === "clients"      && <ClientExplorerView />}
+            {view === "users"        && <UserManagementView />}
             {view === "onboard"      && <OnboardView llmProvider={llmProvider} />}
             {view === "update"       && <UpdateView llmProvider={llmProvider} />}
             {view === "get-idp"      && <GetIDPView llmProvider={llmProvider} />}
             {view === "my-idp"       && <MyIDPView llmProvider={llmProvider} user={user} />}
             {view === "usage"        && <UsageView />}
             {view === "certificates" && <CertificatesView />}
-            {view === "policy"       && <PolicyAssistantView llmProvider={llmProvider} />}
+            {view === "assistant"    && <UnifiedChatView llmProvider={llmProvider} user={user} />}
+            {view === "token-setup"  && <TokenSetupView />}
           </main>
         </div>
       </div>

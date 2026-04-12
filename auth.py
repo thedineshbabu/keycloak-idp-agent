@@ -6,6 +6,7 @@ to activate token enforcement. When disabled, every request gets a default
 admin context so local development works without a Keycloak instance.
 """
 import os
+import time
 
 import httpx
 from fastapi import Depends, Header, HTTPException
@@ -18,6 +19,39 @@ KEYCLOAK_CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "your-client-id")
 
 _CERTS_URL = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
 
+# JWKS cache — refreshed at most once every 15 minutes
+_JWKS_TTL   = 900          # seconds
+_jwks_cache = {"keys": None, "fetched_at": 0.0}
+
+
+async def _get_jwks() -> dict:
+    """
+    Return Keycloak's public JWKS, using a 15-minute in-memory cache.
+    On a fetch failure, returns the last known-good keys if available so
+    that a temporary Keycloak outage does not lock out every request.
+    Raises HTTPException(503) only when the cache is empty and the fetch fails.
+    """
+    now = time.monotonic()
+    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < _JWKS_TTL:
+        return _jwks_cache["keys"]
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+            resp = await client.get(_CERTS_URL)
+            resp.raise_for_status()
+            jwks = resp.json()
+        _jwks_cache["keys"] = jwks
+        _jwks_cache["fetched_at"] = now
+        return jwks
+    except Exception as exc:
+        if _jwks_cache["keys"]:
+            # Keycloak temporarily unreachable — serve from stale cache
+            return _jwks_cache["keys"]
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot reach Keycloak for key fetch: {exc}",
+        )
+
 
 async def verify_token(authorization: str = Header(default=None)) -> dict:
     """
@@ -28,26 +62,24 @@ async def verify_token(authorization: str = Header(default=None)) -> dict:
     app runs normally in local development.
     """
     if not KEYCLOAK_ENABLED:
+        # Still extract the raw bearer token if the frontend sends one, so it
+        # can be forwarded to downstream APIs (Core, IAM) without validation.
+        raw_token = None
+        if authorization and authorization.startswith("Bearer "):
+            raw_token = authorization[7:]
         return {
             "sub": "local-dev",
             "email": "admin@localhost",
             "name": "Local Admin",
             "roles": ["agent-admin"],
-            "access_token": None,
+            "access_token": raw_token,
         }
 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization: Bearer <token> header required")
 
     token = authorization[7:]
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(_CERTS_URL)
-            resp.raise_for_status()
-            jwks = resp.json()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Cannot reach Keycloak for key fetch: {exc}")
+    jwks  = await _get_jwks()
 
     try:
         # Decode without audience enforcement — Keycloak access tokens often carry

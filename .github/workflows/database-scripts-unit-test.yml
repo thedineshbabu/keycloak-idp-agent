@@ -1,0 +1,92 @@
+name: kf-talentsuite-platform-agent-database-scripts-unit-test
+run-name: kf-talentsuite-platform-agent-database-scripts-unit-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - develop
+      - 'rc/v**'
+    paths:
+      - 'yuniql/**'
+  push:
+    branches:
+      - main
+      - develop
+      - 'rc/v**'
+    paths:
+      - 'yuniql/**'
+
+jobs:
+  DatabaseTest:
+    name: Validate yuniql migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: iam_db
+          POSTGRES_USER: iam_user
+          POSTGRES_PASSWORD: iam_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U iam_user -d iam_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create idp_agent schema
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: iam_user
+          PGPASSWORD: iam_pass
+          PGDATABASE: iam_db
+        run: psql -c "CREATE SCHEMA IF NOT EXISTS idp_agent;"
+
+      - name: Run yuniql migration scripts
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: iam_user
+          PGPASSWORD: iam_pass
+          PGDATABASE: iam_db
+        run: |
+          for f in yuniql/scripts/v0.00/*.sql; do
+            echo "Applying $f ..."
+            psql -f "$f"
+          done
+
+      - name: Verify tables exist
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: iam_user
+          PGPASSWORD: iam_pass
+          PGDATABASE: iam_db
+        run: |
+          for table in llm_usage_logs chat_history; do
+            psql -c "SELECT 1 FROM idp_agent.${table} LIMIT 0;" \
+              && echo "OK: ${table}" \
+              || { echo "FAIL: ${table} not found"; exit 1; }
+          done
+
+      - name: Verify idempotency (re-run scripts)
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: iam_user
+          PGPASSWORD: iam_pass
+          PGDATABASE: iam_db
+        run: |
+          for f in yuniql/scripts/v0.00/*.sql; do
+            echo "Re-applying $f ..."
+            psql -f "$f"
+          done
+          echo "All scripts are idempotent."

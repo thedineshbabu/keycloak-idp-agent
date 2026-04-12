@@ -4,12 +4,14 @@ Fetches realm roles, clients, authorization policies, users, and groups
 using service account credentials (client_credentials grant).
 """
 import os
+import re
 import time
 from typing import Optional
 
 import httpx
 
 KEYCLOAK_URL             = os.getenv("KEYCLOAK_URL", "http://localhost:8080")
+KEYCLOAK_REALM           = os.getenv("KEYCLOAK_REALM", "master")
 KEYCLOAK_ADMIN_CLIENT_ID = os.getenv("KEYCLOAK_ADMIN_CLIENT_ID", "")
 KEYCLOAK_ADMIN_CLIENT_SECRET = os.getenv("KEYCLOAK_ADMIN_CLIENT_SECRET", "")
 
@@ -55,14 +57,39 @@ class KeycloakAdminClient:
             r.raise_for_status()
             return r.json()
 
+    async def _post(self, realm: str, path: str, body: dict) -> httpx.Response:
+        """Authenticated POST against the Keycloak Admin REST API. Returns the raw response."""
+        token = await self._get_token(realm)
+        url = f"{KEYCLOAK_URL}/admin/realms/{realm}{path}"
+        async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
+            r = await client.post(
+                url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            r.raise_for_status()
+            return r
+
     # ── Realm helpers ─────────────────────────────────────────────────────────
 
     async def get_realms(self) -> list[dict]:
-        """List all realms visible to the service account (master realm only)."""
-        token = await self._get_token("master")
+        """
+        List realms visible to the service account.
+        Tries /admin/realms (requires master-realm cross-realm rights); if that
+        returns 403, falls back to returning just the configured realm so the
+        Policy Assistant still works with single-realm service accounts.
+        """
+        token = await self._get_token(KEYCLOAK_REALM)
         url = f"{KEYCLOAK_URL}/admin/realms"
         async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
             r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            if r.status_code == 403:
+                # Service account can only see its own realm — return it directly
+                return [{"id": KEYCLOAK_REALM, "realm": KEYCLOAK_REALM,
+                         "displayName": KEYCLOAK_REALM, "enabled": True}]
             r.raise_for_status()
             realms = r.json()
         return [{"id": rl.get("id"), "realm": rl.get("realm"),
@@ -129,6 +156,52 @@ class KeycloakAdminClient:
         """Search users by username, email, first name, or last name."""
         return await self._get(realm, "/users", {"search": search, "max": 20})
 
+    async def get_users(self, realm: str, max: int = 100) -> list[dict]:
+        """List up to *max* users in the realm with no filter."""
+        return await self._get(realm, "/users", {"max": max, "briefRepresentation": "false"})
+
+    async def get_user_count(self, realm: str) -> int:
+        """Return the total number of users in the realm via the dedicated count endpoint."""
+        result = await self._get(realm, "/users/count")
+        # Keycloak returns a plain integer for this endpoint
+        return int(result) if isinstance(result, (int, float, str)) else 0
+
+    async def get_user_with_details(self, realm: str, user: dict) -> dict:
+        """Augment a user dict with their roles and groups embedded.
+
+        Returns a flat dict the LLM can reason about directly::
+
+            {
+                "id": "...", "username": "...", "email": "...",
+                "enabled": true,
+                "realm_roles": ["admin", "viewer"],
+                "client_roles": {"my-app": ["editor"]},
+                "groups": ["team-a", "org-b"]
+            }
+        """
+        uid = user["id"]
+        result = {
+            k: user.get(k)
+            for k in ("id", "username", "email", "firstName", "lastName", "enabled", "emailVerified")
+            if user.get(k) is not None
+        }
+        try:
+            roles = await self.get_user_roles(realm, uid)
+            result["realm_roles"]    = [r["name"] for r in roles.get("realm_roles", [])]
+            result["client_roles"]   = {
+                client: [r["name"] for r in role_list]
+                for client, role_list in roles.get("client_roles", {}).items()
+                if role_list
+            }
+        except Exception:
+            pass
+        try:
+            groups = await self.get_user_groups(realm, uid)
+            result["groups"] = [g.get("name") or g.get("path", "") for g in groups]
+        except Exception:
+            pass
+        return result
+
     async def get_user_roles(self, realm: str, user_id: str) -> dict:
         """Effective realm roles and client roles for a user."""
         realm_roles = await self._get(realm, f"/users/{user_id}/role-mappings/realm")
@@ -162,6 +235,88 @@ class KeycloakAdminClient:
         """Top-level groups in the realm."""
         return await self._get(realm, "/groups")
 
+    # ── Protocol mapper management ────────────────────────────────────────────
+
+    async def get_client_by_client_id(self, realm: str, client_id: str) -> Optional[dict]:
+        """Return the first client whose ``clientId`` matches *client_id*, or None."""
+        clients = await self._get(realm, "/clients", {"clientId": client_id})
+        return clients[0] if clients else None
+
+    async def get_client_mappers(self, realm: str, client_uuid: str) -> list[dict]:
+        """Return all protocol mappers configured on a client."""
+        return await self._get(realm, f"/clients/{client_uuid}/protocol-mappers/models")
+
+    async def ensure_user_id_mapper(
+        self,
+        realm: str,
+        client_id: str,
+        attribute_name: str = "userId",
+        claim_name: str = "userId",
+    ) -> dict:
+        """Idempotently add a ``userId`` user-attribute claim to the client's access token.
+
+        Looks up the client by its ``clientId`` string, inspects existing protocol
+        mappers, and creates the mapper only when absent.
+
+        Args:
+            realm:          Keycloak realm name.
+            client_id:      The ``clientId`` string (not UUID) of the OIDC client.
+            attribute_name: Keycloak user attribute to read (default ``userId``).
+            claim_name:     JWT claim name to emit in the access token (default ``userId``).
+
+        Returns a dict with ``created`` (bool) and ``mapper`` (the mapper definition).
+        """
+        client = await self.get_client_by_client_id(realm, client_id)
+        if not client:
+            raise ValueError(f"Client '{client_id}' not found in realm '{realm}'")
+
+        client_uuid = client["id"]
+        existing = await self.get_client_mappers(realm, client_uuid)
+
+        # Check whether a mapper for this claim already exists
+        for m in existing:
+            if m.get("config", {}).get("claim.name") == claim_name:
+                return {"created": False, "mapper": m}
+
+        mapper_body = {
+            "name": claim_name,
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-usermodel-attribute-mapper",
+            "consentRequired": False,
+            "config": {
+                "user.attribute":      attribute_name,
+                "claim.name":          claim_name,
+                "jsonType.label":      "String",
+                "id.token.claim":      "false",
+                "access.token.claim":  "true",
+                "userinfo.token.claim": "false",
+                "multivalued":         "false",
+                "aggregate.attributes": "false",
+            },
+        }
+        await self._post(realm, f"/clients/{client_uuid}/protocol-mappers/models", mapper_body)
+        return {"created": True, "mapper": mapper_body}
+
+    async def check_user_id_mapper(
+        self,
+        realm: str,
+        client_id: str,
+        claim_name: str = "userId",
+    ) -> dict:
+        """Check whether the ``userId`` claim mapper exists on a client.
+
+        Returns ``{"exists": bool, "mapper": dict | None}``.
+        """
+        client = await self.get_client_by_client_id(realm, client_id)
+        if not client:
+            raise ValueError(f"Client '{client_id}' not found in realm '{realm}'")
+
+        existing = await self.get_client_mappers(realm, client["id"])
+        for m in existing:
+            if m.get("config", {}).get("claim.name") == claim_name:
+                return {"exists": True, "mapper": m}
+        return {"exists": False, "mapper": None}
+
     # ── Smart context builder ─────────────────────────────────────────────────
 
     async def build_context(self, realm: str, query: str) -> dict:
@@ -189,26 +344,61 @@ class KeycloakAdminClient:
             raw_clients = []
             context["clients"] = []
 
-        # User / email queries
-        user_keywords = ("user", "email", "who", "member", "assigned", "belong")
-        if any(kw in q for kw in user_keywords):
-            # Extract a potential search term — grab the last word that looks like
-            # an email or a username (heuristic)
-            words = [w.strip("?,.'\"") for w in query.split()]
-            search_term = next(
-                (w for w in reversed(words) if "@" in w or (len(w) > 3 and w.isalpha())),
-                "",
-            )
-            if search_term:
-                try:
-                    users = await self.search_users(realm, search_term)
-                    context["users"] = users
-                    if users:
-                        uid = users[0]["id"]
-                        context["user_roles"]  = await self.get_user_roles(realm, uid)
-                        context["user_groups"] = await self.get_user_groups(realm, uid)
-                except Exception as e:
-                    errors.append(f"users: {e}")
+        # ── User queries ──────────────────────────────────────────────────────
+        _USER_KW = (
+            "user", "email", "who", "member", "assigned", "belong",
+            "access", "account", "login", "person", "people", "staff",
+            "role of", "roles of", "has role", "permission",
+            "how many", "count", "total",
+        )
+        if any(kw in q for kw in _USER_KW):
+            # 1. Always fetch the authoritative total count first.
+            try:
+                context["user_count"] = await self.get_user_count(realm)
+            except Exception as e:
+                errors.append(f"user_count: {e}")
+
+            search_terms = _extract_user_search_terms(query)
+
+            # 2. Build the basic user list — kept lightweight (no roles yet) so
+            #    we can include everyone without blowing the token budget.
+            all_users: list[dict] = []
+            try:
+                all_users = await self.get_users(realm, max=100)
+            except Exception as e:
+                errors.append(f"users_all: {e}")
+
+            # Slim each user down to the fields the LLM needs for enumeration
+            _BASIC_FIELDS = ("id", "username", "email", "firstName", "lastName", "enabled")
+            context["users"] = [
+                {k: u[k] for k in _BASIC_FIELDS if k in u}
+                for u in all_users
+            ]
+
+            # 3. For queries that mention specific users, augment only those
+            #    users with their full roles + groups so the LLM can answer
+            #    permission questions without inflating the payload for everyone.
+            if search_terms:
+                named: list[dict] = []
+                seen_ids: set[str] = set()
+                for term in search_terms:
+                    try:
+                        for u in await self.search_users(realm, term):
+                            if u["id"] not in seen_ids:
+                                seen_ids.add(u["id"])
+                                named.append(u)
+                    except Exception as e:
+                        errors.append(f"users({term}): {e}")
+
+                if named:
+                    detailed = []
+                    for u in named[:10]:   # cap at 10 to avoid timeout
+                        try:
+                            detailed.append(await self.get_user_with_details(realm, u))
+                        except Exception as e:
+                            detailed.append(u)
+                            errors.append(f"user_details({u.get('username')}): {e}")
+                    context["users_with_roles"] = detailed
 
         # Policy / permission / authorization queries
         authz_keywords = ("policy", "permission", "access", "resource", "scope", "allow", "deny", "block")
@@ -263,3 +453,60 @@ def _extract_role_name(query: str, roles: list[dict]) -> Optional[str]:
         if name and name.lower() in query:
             return name
     return None
+
+
+# Words that are never usernames — used to filter false positives
+_STOP_WORDS = {
+    "the", "a", "an", "this", "that", "my", "your", "their", "our",
+    "user", "users", "role", "roles", "group", "groups", "realm",
+    "client", "clients", "policy", "policies", "permission", "permissions",
+    "access", "account", "accounts", "have", "has", "get", "show",
+    "what", "which", "who", "where", "when", "why", "how",
+    "does", "do", "did", "is", "are", "was", "were",
+    "all", "any", "some", "no", "not", "and", "or", "for",
+    "in", "on", "at", "to", "of", "with", "by", "from",
+}
+
+
+def _extract_user_search_terms(query: str) -> list[str]:
+    """Extract likely username / email identifiers from a natural-language query.
+
+    Strategies (applied in order, results deduplicated):
+    1. Email addresses  (``john@example.com``)
+    2. Words after context prepositions  ("for alice", "does bob", "user carol")
+    3. Dotted / underscored tokens that look like login names  ("john.doe", "jane_smith")
+    4. Quoted strings  (``"alice"`` or ``'bob'``)
+    """
+    terms: list[str] = []
+
+    # 1. Email addresses
+    terms += re.findall(r"[\w.+%-]+@[\w.-]+\.\w+", query)
+
+    # 2. Words that follow user-identity prepositions / verbs
+    for m in re.finditer(
+        r"(?:user|does|is|for|about|of|on behalf of)\s+([\w.@+%-]{2,})",
+        query,
+        re.IGNORECASE,
+    ):
+        candidate = m.group(1).rstrip("?.,;:'\"")
+        if candidate.lower() not in _STOP_WORDS:
+            terms.append(candidate)
+
+    # 3. Dotted / underscored identifiers that look like login names
+    for m in re.finditer(r"\b([\w][\w.+-]{1,}[\w])\b", query):
+        token = m.group(1)
+        if ("." in token or "_" in token or "-" in token) and token.lower() not in _STOP_WORDS:
+            terms.append(token)
+
+    # 4. Quoted strings
+    for m in re.finditer(r'"([^"]{2,}?)"|\'([^\']{2,}?)\'', query):
+        terms.append(m.group(1) or m.group(2))
+
+    # Deduplicate while preserving order; skip pure-stop-word matches
+    seen: set[str] = set()
+    result: list[str] = []
+    for t in terms:
+        if t and t.lower() not in _STOP_WORDS and t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result

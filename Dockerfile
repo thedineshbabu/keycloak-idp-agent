@@ -8,7 +8,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py agent.py skill.py tools.py auth.py ./
+COPY main.py agent.py skill.py tools.py auth.py \
+     keycloak_admin.py policy_engine.py platform_api.py chat_engine.py \
+     ./
 
 EXPOSE 8000
 
