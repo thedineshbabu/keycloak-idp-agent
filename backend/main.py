@@ -1,5 +1,5 @@
-from dotenv import load_dotenv
-load_dotenv()  # Must run before any project module is imported (they read env vars at module level)
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(usecwd=True))  # Must run before any project module is imported (they read env vars at module level)
 
 from contextlib import asynccontextmanager
 import logging
