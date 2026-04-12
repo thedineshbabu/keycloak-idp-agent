@@ -46,6 +46,8 @@ React (App.jsx) → FastAPI (main.py) → IDPAgent / PolicyQueryEngine / platfor
                   PostgreSQL  |  Core API (clients/products)  |  IAM API (users/roles)
                                               ↓
                                    Keycloak Admin REST API
+                                              ↓
+                                   Datadog (logs / traces / metrics / monitors)
 ```
 
 ### Key backend modules
@@ -60,6 +62,7 @@ React (App.jsx) → FastAPI (main.py) → IDPAgent / PolicyQueryEngine / platfor
 | `keycloak_admin.py` | `KeycloakAdminClient` — service account auth + `build_context()` for policy queries |
 | `platform_api.py` | Async httpx client for Core API and IAM API |
 | `policy_engine.py` | `PolicyQueryEngine` — builds Keycloak context, calls LLM, returns structured answer |
+| `datadog_api.py` | Async httpx client for Datadog logs, traces, metrics, monitors, and events (optional) |
 
 ### Frontend
 
@@ -79,7 +82,9 @@ React (App.jsx) → FastAPI (main.py) → IDPAgent / PolicyQueryEngine / platfor
 
 **Role model**: Two roles — `agent-admin` (full write access, guarded by `require_admin` dependency) and read-only access for any authenticated user. Roles come from both `realm_access.roles` and `resource_access.<client_id>.roles` in the JWT.
 
-**LLM calls**: Both `agent.py` and `policy_engine.py` call LLMs directly via httpx (no SDK). Every call is wrapped in a `try/finally` that logs usage to `llm_usage_logs` via `log_llm_usage()` in `tools.py`. LLM JSON responses are parsed with markdown fence stripping as a fallback.
+**LLM calls**: Both `agent.py` and `policy_engine.py` call LLMs directly via httpx (no SDK). Every call is wrapped in a `try/finally` that logs usage to `llm_usage_logs` via `log_llm_usage()` in `tools.py`. LLM JSON responses are parsed with markdown fence stripping as a fallback. The LLM provider is controlled server-side via `DEFAULT_LLM_PROVIDER` env var (default `gemini`) — the frontend does not send or choose a provider.
+
+**Usage guardrails**: Each user is limited to `DAILY_QUERY_LIMIT` (default 10) chat and policy queries per day. The limit is enforced in `/chat` and `/policy/query` endpoints via `_check_rate_limit()` which counts today's user messages in `chat_history`. Set to `0` to disable. Both config values are exposed via `GET /config`.
 
 **APScheduler**: The daily certificate scan at 8am is optional — main.py wraps the import in try/except so the app starts normally if `apscheduler` is not installed.
 
@@ -91,3 +96,4 @@ React (App.jsx) → FastAPI (main.py) → IDPAgent / PolicyQueryEngine / platfor
 - **Add LLM cost rates for new models**: `tools.py` → `log_llm_usage()` cost table
 - **Richer policy query context**: `keycloak_admin.py` → `build_context()`
 - **New platform endpoints**: `platform_api.py` + wire in `main.py`
+- **Add Datadog data sources**: `datadog_api.py` + register tools in `chat_engine.py` (`_DD_TOOLS` + `_execute_tool`)

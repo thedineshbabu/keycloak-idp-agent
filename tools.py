@@ -108,6 +108,26 @@ def get_session_messages(session_id: str, user_sub: str) -> list[dict]:
         return []
 
 
+def get_daily_query_count(user_sub: str) -> int:
+    """Count today's user-initiated messages (role='user') in chat_history."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM chat_history
+            WHERE user_sub = %s
+              AND role = 'user'
+              AND created_at >= CURRENT_DATE
+        """, (user_sub,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row["cnt"] if row else 0
+    except Exception:
+        return 0
+
+
 def fetch_existing_idps(limit: int = 20) -> list[dict]:
     """Return existing IDP configs to learn patterns (mock data for now; live data comes from Core API)."""
     return _mock_existing_idps()
