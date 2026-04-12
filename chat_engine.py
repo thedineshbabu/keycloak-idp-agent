@@ -11,6 +11,15 @@ from typing import Optional
 
 import httpx
 
+from datadog_api import (
+    _parse_time_range,
+    dd_available,
+    dd_get_active_monitors,
+    dd_query_metrics,
+    dd_search_events,
+    dd_search_logs,
+    dd_search_traces,
+)
 from keycloak_admin import KeycloakAdminClient
 from platform_api import (
     get_active_products,
@@ -642,6 +651,175 @@ _TOOLS = [
     },
 ]
 
+_WRITE_TOOLS = frozenset({
+    "iam_lock_unlock_users",
+    "iam_update_user_status",
+    "iam_reset_password",
+    "iam_send_magic_link",
+    "iam_send_otp",
+    "core_create_sso_attributes",
+    "core_upsert_sso_attributes",
+    "keycloak_ensure_userid_mapper",
+})
+
+# ── Datadog tool definitions ──────────────────────────────────────────────────
+
+_DD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "dd_search_logs",
+            "description": (
+                "Search Datadog logs for auth errors, login failures, or HTTP errors. "
+                "Query syntax examples: 'service:login-service status:error', "
+                "'@usr.email:john@example.com', '@http.status_code:401'. "
+                "Use the service parameter to scope to a specific service name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Datadog log query string (e.g. 'service:auth status:error')",
+                    },
+                    "time_range": {
+                        "type": "string",
+                        "enum": ["1h", "6h", "24h", "7d"],
+                        "description": "Time window to search (default: 1h)",
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Optional service name to prepend as 'service:<name>' filter",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dd_search_traces",
+            "description": (
+                "Search Datadog APM traces/spans for end-to-end request traces by user or service. "
+                "Useful for understanding request paths and latency for a specific user or operation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Datadog span query string (e.g. 'service:login-service error:true')",
+                    },
+                    "time_range": {
+                        "type": "string",
+                        "enum": ["1h", "6h", "24h", "7d"],
+                        "description": "Time window to search (default: 1h)",
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Optional service name to prepend as 'service:<name>' filter",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dd_query_error_rate",
+            "description": (
+                "Query the error rate metric for a specific service from Datadog. "
+                "Returns the recent error rate timeseries summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string",
+                        "description": "Service name to query error rate for (e.g. 'login-service')",
+                    },
+                    "time_range": {
+                        "type": "string",
+                        "enum": ["1h", "6h", "24h", "7d"],
+                        "description": "Time window (default: 1h)",
+                    },
+                },
+                "required": ["service"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dd_get_active_alerts",
+            "description": (
+                "List currently triggered Datadog monitors (Alert / Warn / No-Data state). "
+                "Optionally filter by monitor name or service tag."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional monitor name substring to filter by",
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Optional service name to filter monitors by tag",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dd_search_events",
+            "description": (
+                "Search Datadog events for deployments, incidents, or configuration changes "
+                "that might have caused an issue."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Event search query (e.g. 'deploy login-service')",
+                    },
+                    "time_range": {
+                        "type": "string",
+                        "enum": ["1h", "6h", "24h", "7d"],
+                        "description": "Time window (default: 24h)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+_DD_SYSTEM_PROMPT_SECTION = """
+5. **Datadog** — logs, traces, metrics, monitors, and events
+   Use for: auth error investigation, login failure root cause, service error rates, active alerts,
+   recent deployments or incidents that correlate with user-reported issues.
+
+**L2 Troubleshooting methodology for login issues:**
+1. Check user account in IAM (iam_search_users) — is it active, unlocked?
+2. Check login mode in Core (core_get_login_mode) — SSO or password?
+3. Search Datadog logs for auth errors (dd_search_logs with user email or service filter)
+4. Check active Datadog alerts (dd_get_active_alerts) — any ongoing incidents?
+5. Correlate findings and report root cause with evidence from each source.
+
+**Datadog query syntax guidance:**
+- Filter by service: `service:my-service`
+- Filter by user email: `@usr.email:john@example.com`
+- Filter by HTTP status: `@http.status_code:401`
+- Filter by error: `status:error` or `error:true` (for traces)
+- Combine filters: `service:login-service @http.status_code:401`
+"""
+
 
 # ── Gemini schema helpers ─────────────────────────────────────────────────────
 
@@ -696,6 +874,7 @@ class UnifiedChatEngine:
         realm: str,
         token: Optional[str],
         provider: str = "openai",
+        user_roles: Optional[list] = None,
     ) -> dict:
         """
         Returns:
@@ -705,18 +884,21 @@ class UnifiedChatEngine:
                 "token_usage": dict,         # {prompt_tokens, completion_tokens, total_tokens}
             }
         """
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        tools = _TOOLS + (_DD_TOOLS if dd_available() else [])
+        system_prompt = SYSTEM_PROMPT + (_DD_SYSTEM_PROMPT_SECTION if dd_available() else "")
+
+        messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-20:])   # up to last 10 turns for context
         messages.append({"role": "user", "content": message})
 
         if provider == "gemini":
-            return await self._gemini_loop(messages, realm, token)
-        return await self._openai_loop(messages, realm, token)
+            return await self._gemini_loop(messages, realm, token, tools, system_prompt, user_roles)
+        return await self._openai_loop(messages, realm, token, tools, user_roles)
 
     # ── OpenAI agentic loop ───────────────────────────────────────────────────
 
     async def _openai_loop(
-        self, messages: list, realm: str, token: Optional[str]
+        self, messages: list, realm: str, token: Optional[str], tools: list, user_roles: Optional[list] = None
     ) -> dict:
         sources: list[str] = []
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -736,7 +918,7 @@ class UnifiedChatEngine:
                         json={
                             "model": "gpt-4o",
                             "messages": messages,
-                            "tools": _TOOLS,
+                            "tools": tools,
                             "tool_choice": "auto",
                             "temperature": 0.2,
                             "max_tokens": 2000,
@@ -772,7 +954,7 @@ class UnifiedChatEngine:
                     fn_name = tc["function"]["name"]
                     fn_args = json.loads(tc["function"]["arguments"] or "{}")
                     sources.append(fn_name)
-                    result = await self._execute_tool(fn_name, fn_args, realm, token)
+                    result = await self._execute_tool(fn_name, fn_args, realm, token, user_roles)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -798,7 +980,7 @@ class UnifiedChatEngine:
     # ── Gemini agentic loop ───────────────────────────────────────────────────
 
     async def _gemini_loop(
-        self, messages: list, realm: str, token: Optional[str]
+        self, messages: list, realm: str, token: Optional[str], tools: list, system_prompt: str, user_roles: Optional[list] = None
     ) -> dict:
         sources: list[str] = []
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -807,17 +989,16 @@ class UnifiedChatEngine:
         success = False
 
         # Split off the system message; convert the rest to Gemini format
-        system_text = ""
+        system_text = system_prompt
         gemini_contents: list = []
         for m in messages:
             if m["role"] == "system":
-                system_text = m["content"]
                 continue
             role = "user" if m["role"] == "user" else "model"
             content = m.get("content") or ""
             gemini_contents.append({"role": role, "parts": [{"text": content}]})
 
-        gemini_tools = _openai_to_gemini_tools(_TOOLS)
+        gemini_tools = _openai_to_gemini_tools(tools)
 
         try:
             for _round in range(5):
@@ -868,7 +1049,7 @@ class UnifiedChatEngine:
                     fn_name = fn_call["name"]
                     fn_args = fn_call.get("args", {})
                     sources.append(fn_name)
-                    result = await self._execute_tool(fn_name, fn_args, realm, token)
+                    result = await self._execute_tool(fn_name, fn_args, realm, token, user_roles)
                     fn_responses.append({
                         "functionResponse": {
                             "name": fn_name,
@@ -895,10 +1076,12 @@ class UnifiedChatEngine:
     # ── Tool execution ────────────────────────────────────────────────────────
 
     async def _execute_tool(
-        self, name: str, args: dict, realm: str, token: Optional[str]
+        self, name: str, args: dict, realm: str, token: Optional[str], user_roles: Optional[list] = None
     ):
         """Dispatch a tool call. Returns a JSON-serialisable result or an error dict."""
         try:
+            if name in _WRITE_TOOLS and "agent-admin" not in (user_roles or []):
+                return {"error": "You need admin privileges to perform this action", "tool": name, "blocked": True}
             # ── Keycloak ──────────────────────────────────────────────────────
             if name == "keycloak_list_roles":
                 return await self.kc.get_realm_roles(args.get("realm", realm))
@@ -1084,6 +1267,47 @@ class UnifiedChatEngine:
 
             if name == "usage_by_provider":
                 return get_usage_by_provider()
+
+            # ── Datadog ───────────────────────────────────────────────────────
+            if name == "dd_search_logs":
+                time_range = args.get("time_range", "1h")
+                from_ts, to_ts = _parse_time_range(time_range)
+                query = args.get("query", "")
+                service = args.get("service")
+                if service:
+                    query = f"service:{service} {query}".strip()
+                return await dd_search_logs(query, from_ts, to_ts)
+
+            if name == "dd_search_traces":
+                time_range = args.get("time_range", "1h")
+                from_ts, to_ts = _parse_time_range(time_range)
+                query = args.get("query", "")
+                service = args.get("service")
+                if service:
+                    query = f"service:{service} {query}".strip()
+                return await dd_search_traces(query, from_ts, to_ts)
+
+            if name == "dd_query_error_rate":
+                time_range = args.get("time_range", "1h")
+                from_ts, to_ts = _parse_time_range(time_range)
+                # Convert ISO 8601 timestamps to Unix epoch integers for the metrics API
+                from datetime import datetime as _dt
+                from_epoch = int(_dt.fromisoformat(from_ts.replace("Z", "+00:00")).timestamp())
+                to_epoch   = int(_dt.fromisoformat(to_ts.replace("Z", "+00:00")).timestamp())
+                service = args.get("service", "")
+                metric_query = f"sum:trace.web.request.errors{{service:{service}}}.as_count()"
+                return await dd_query_metrics(metric_query, from_epoch, to_epoch)
+
+            if name == "dd_get_active_alerts":
+                query   = args.get("query", "")
+                service = args.get("service")
+                tags    = [f"service:{service}"] if service else None
+                return await dd_get_active_monitors(query=query, tags=tags)
+
+            if name == "dd_search_events":
+                time_range = args.get("time_range", "24h")
+                from_ts, to_ts = _parse_time_range(time_range)
+                return await dd_search_events(args.get("query", ""), from_ts, to_ts)
 
             return {"error": f"Unknown tool: {name}"}
 

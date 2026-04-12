@@ -113,5 +113,5 @@ async def verify_token(authorization: str = Header(default=None)) -> dict:
 def require_admin(user: dict = Depends(verify_token)) -> dict:
     """Use as a FastAPI dependency to restrict an endpoint to agent-admin role."""
     if "agent-admin" not in user.get("roles", []):
-        raise HTTPException(status_code=403, detail="agent-admin role required")
+        raise HTTPException(status_code=403, detail="You need admin privileges to perform this action")
     return user
