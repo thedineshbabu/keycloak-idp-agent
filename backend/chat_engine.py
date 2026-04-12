@@ -49,7 +49,6 @@ from tools import (
     get_usage_by_provider,
     get_usage_summary,
     log_llm_usage,
-    parse_certificate_expiry,
     scan_all_certificates,
 )
 

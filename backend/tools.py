@@ -3,7 +3,6 @@ Agent Tools
 Functions the agent can call to interact with PostgreSQL, IAM service, and simulate auth flows.
 """
 import re
-import json
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -317,7 +316,7 @@ async def simulate_auth_flow(config: dict) -> dict:
         steps.append({
             "step": "SSO URL Reachability",
             "status": "pass" if reachable else "warn",
-            "detail": f"SSO endpoint responded" if reachable else f"Could not reach {sso_url} (may be internal network)"
+            "detail": "SSO endpoint responded" if reachable else f"Could not reach {sso_url} (may be internal network)"
         })
     else:
         steps.append({
@@ -416,7 +415,6 @@ def _core_headers(token: Optional[str] = None) -> dict:
 
 def _idp_to_core_payload(config: dict) -> dict:
     """Map internal IDP config fields → Core API custom-attributes payload."""
-    payload = {}
     _map = {
         "idpEntityId":                 config.get("entity_id"),
         "singleSignOnServiceUrl":      config.get("sso_url"),

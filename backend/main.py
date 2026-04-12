@@ -44,7 +44,6 @@ from tools import (
     core_create_domain_attributes,
     core_get_domain_attributes,
     core_upsert_domain_attributes,
-    fetch_idp_by_domain,
     get_chat_sessions,
     get_daily_query_count,
     get_recent_usage,
