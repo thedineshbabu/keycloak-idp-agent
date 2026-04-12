@@ -1,43 +1,17 @@
-# ── Secrets ───────────────────────────────────────────────────────────────────
+# Environment — never commit secrets
 .env
-*.key
-*.pem
 
-# ── Python ────────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
 venv/
 .venv/
-env/
 *.egg-info/
-dist/
-build/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# ── Node / Frontend ───────────────────────────────────────────────────────────
+# Node
 node_modules/
 dist/
-.vite/
-*.local
 
-# ── Editor / OS ───────────────────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-.idea/
+# IDE
 .vscode/
-*.iml
-
-# ── Logs & temp ───────────────────────────────────────────────────────────────
-*.log
-tmp/
-.tmp/
-
-# ── Claude Code ───────────────────────────────────────────────────────────────
-.claude/
+.idea/

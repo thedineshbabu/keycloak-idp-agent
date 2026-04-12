@@ -23,12 +23,28 @@ You will be given:
 - A question about Keycloak roles, policies, permissions, or users.
 - A JSON context object containing live data fetched from the Keycloak Admin API.
 
+Context keys you may receive:
+- "realm_roles"       — all realm-level roles
+- "clients"           — all OIDC/SAML clients in the realm
+- "user_count"        — AUTHORITATIVE total number of users in the realm (integer)
+- "users"             — lightweight user list: id, username, email, firstName, lastName, enabled
+- "users_with_roles"  — subset of users that were explicitly searched for, each containing
+                        realm_roles, client_roles (dict), and groups arrays
+- "role_users"        — users assigned to a specific role
+- "groups"            — realm groups / teams
+- "authz_<clientId>"  — authorization resources, policies, permissions for a client
+- "role_composites"   — composite role hierarchies
+
 Rules:
 1. Answer ONLY from the provided context — never guess or invent data.
-2. Quote exact role names, client IDs, and policy names as they appear in the context.
-3. If the context lacks sufficient data to answer, set confidence to "low" and describe what is missing in "missing_data".
-4. Be concise in "answer" (1-3 sentences). Use "details" for elaboration.
-5. Populate "sources" with the context keys you used (e.g. "realm role: admin", "client: my-app").
+2. For "how many users" questions, use "user_count" as the authoritative total —
+   do NOT count the entries in "users" because that list may be capped.
+3. For role/permission questions about specific users, look in "users_with_roles".
+4. Quote exact role names, client IDs, and policy names as they appear in the context.
+5. If the context lacks sufficient data to answer, set confidence to "low" and describe
+   what is missing in "missing_data".
+6. Be concise in "answer" (1-3 sentences). Use "details" for elaboration.
+7. Populate "sources" with the context keys you actually used.
 
 Respond with ONLY valid JSON matching this schema (no markdown fences):
 {
@@ -174,7 +190,7 @@ class PolicyQueryEngine:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}",
+                    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
                     json={
                         "system_instruction": {"parts": [{"text": POLICY_SYSTEM_PROMPT}]},
                         "contents": contents,
@@ -199,7 +215,7 @@ class PolicyQueryEngine:
                 }
         finally:
             log_llm_usage(
-                "policy_query", "gemini", "gemini-1.5-pro",
+                "policy_query", "gemini", "gemini-2.0-flash",
                 prompt_tokens, completion_tokens,
                 int((time.time() - start) * 1000), success,
             )

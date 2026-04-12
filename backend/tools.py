@@ -3,13 +3,10 @@ Agent Tools
 Functions the agent can call to interact with PostgreSQL, IAM service, and simulate auth flows.
 """
 import re
-import json
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import httpx
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 from skill import VALIDATION_RULES
 
@@ -33,38 +30,114 @@ CORE_API_BEARER_TOKEN = os.getenv("CORE_API_BEARER_TOKEN", "")
 # ── Database helpers ──────────────────────────────────────────────────────────
 
 def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
+    """Return a psycopg2 connection with search_path set to idp_agent,public."""
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    conn = psycopg2.connect(
+        **DB_CONFIG,
+        cursor_factory=RealDictCursor,
+        options="-c search_path=idp_agent,public",
+    )
+    return conn
 
 
-def fetch_existing_idps(limit: int = 20) -> list[dict]:
-    """Fetch existing IDP configs from PostgreSQL to learn patterns."""
+# ── Chat history helpers ──────────────────────────────────────────────────────
+
+def save_chat_message(session_id: str, user_sub: str, user_email: str,
+                      role: str, message: str) -> None:
+    """Persist a single chat turn (role = 'user' | 'assistant') to PostgreSQL."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO chat_history (session_id, user_sub, user_email, role, message)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (session_id, user_sub, user_email or "", role, message),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_chat_sessions(user_sub: str, limit: int = 30) -> list[dict]:
+    """Return recent sessions for a user with a first-message preview."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT idp_name, email_domains, protocol, entity_id, sso_url,
-                   name_id_format, attribute_mapping,
-                   want_assertions_signed, is_active, created_at
-            FROM idp_configurations
-            ORDER BY created_at DESC
+            SELECT
+                session_id,
+                MIN(created_at)  AS started_at,
+                COUNT(*)         AS message_count,
+                (SELECT message FROM chat_history c2
+                 WHERE c2.session_id = c1.session_id AND c2.role = 'user'
+                 ORDER BY c2.created_at ASC LIMIT 1) AS preview
+            FROM chat_history c1
+            WHERE user_sub = %s
+            GROUP BY session_id
+            ORDER BY started_at DESC
             LIMIT %s
-        """, (limit,))
+        """, (user_sub, limit))
         rows = cur.fetchall()
         cur.close()
         conn.close()
         return [dict(r) for r in rows]
-    except Exception as e:
-        # Return mock data if DB not available (for prototyping)
-        return _mock_existing_idps()
+    except Exception:
+        return []
+
+
+def get_session_messages(session_id: str, user_sub: str) -> list[dict]:
+    """Return all messages in a session, verifying ownership."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT role, message, created_at
+            FROM chat_history
+            WHERE session_id = %s AND user_sub = %s
+            ORDER BY created_at ASC
+        """, (session_id, user_sub))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_daily_query_count(user_sub: str) -> int:
+    """Count today's user-initiated messages (role='user') in chat_history."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM chat_history
+            WHERE user_sub = %s
+              AND role = 'user'
+              AND created_at >= CURRENT_DATE
+        """, (user_sub,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row["cnt"] if row else 0
+    except Exception:
+        return 0
+
+
+def fetch_existing_idps(limit: int = 20) -> list[dict]:
+    """Return existing IDP configs to learn patterns (mock data for now; live data comes from Core API)."""
+    return _mock_existing_idps()
 
 
 def fetch_idp_by_domain(email_domain: str, token: Optional[str] = None) -> Optional[dict]:
     """
     Fetch a specific IDP config by domain.
-    Priority: Core API → local PostgreSQL → mock fallback.
+    Priority: Core API custom attributes → mock fallback.
     Passes the caller's access token to the Core API when available.
     """
-    # Try Core API first (synchronous wrapper)
     try:
         core_result = asyncio.get_event_loop().run_until_complete(
             core_get_domain_attributes(email_domain, token)
@@ -74,19 +147,7 @@ def fetch_idp_by_domain(email_domain: str, token: Optional[str] = None) -> Optio
     except Exception:
         pass
 
-    # Fall back to local DB
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM idp_configurations WHERE %s = ANY(email_domains)
-        """, (email_domain,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        return dict(row) if row else None
-    except Exception:
-        return _mock_idp_by_domain(email_domain)
+    return _mock_idp_by_domain(email_domain)
 
 
 # ── IAM Service API calls ─────────────────────────────────────────────────────
@@ -129,7 +190,7 @@ async def push_to_iam(config: dict, operation: str = "create", token: Optional[s
     if isinstance(domains, str):
         domains = [domains]
     primary_domain = domains[0] if domains else config.get("email_domain", "")
-    if primary_domain and (token or CORE_API_BEARER_TOKEN):
+    if primary_domain and token:
         core_result = await core_upsert_domain_attributes(primary_domain, config, token)
 
     # Overall success: IAM must succeed; Core API is best-effort
@@ -255,7 +316,7 @@ async def simulate_auth_flow(config: dict) -> dict:
         steps.append({
             "step": "SSO URL Reachability",
             "status": "pass" if reachable else "warn",
-            "detail": f"SSO endpoint responded" if reachable else f"Could not reach {sso_url} (may be internal network)"
+            "detail": "SSO endpoint responded" if reachable else f"Could not reach {sso_url} (may be internal network)"
         })
     else:
         steps.append({
@@ -345,16 +406,15 @@ def generate_idp_config(inputs: dict, existing_patterns: list[dict]) -> dict:
 #   PUT  /v2/clients/customAttributes?domainUrl=…  → upsertClientCustomAttributes
 
 def _core_headers(token: Optional[str] = None) -> dict:
-    bearer = token or CORE_API_BEARER_TOKEN
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {bearer}",
-    }
+    # Always use the logged-in user's access token.
+    hdrs = {"Content-Type": "application/json"}
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    return hdrs
 
 
 def _idp_to_core_payload(config: dict) -> dict:
     """Map internal IDP config fields → Core API custom-attributes payload."""
-    payload = {}
     _map = {
         "idpEntityId":                 config.get("entity_id"),
         "singleSignOnServiceUrl":      config.get("sso_url"),
@@ -402,11 +462,18 @@ async def core_get_domain_attributes(domain_url: str, token: Optional[str] = Non
     Raises httpx.HTTPStatusError for any other HTTP error (401, 403, 500, …)
     so callers can surface the real failure instead of silently returning None.
     """
-    if not (token or CORE_API_BEARER_TOKEN):
+    import logging
+    log = logging.getLogger("core_api")
+    if not CORE_API_BASE_URL:
         return None
     url = f"{CORE_API_BASE_URL}/v2/clients/customAttributes"
+    hdrs = _core_headers(token)
+    log.warning("core_get_domain_attributes: GET %s?domainUrl=%s auth=%s",
+                url, domain_url, "yes" if hdrs.get("Authorization") else "no")
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-        resp = await client.get(url, params={"domainUrl": domain_url}, headers=_core_headers(token))
+        resp = await client.get(url, params={"domainUrl": domain_url}, headers=hdrs)
+        log.warning("core_get_domain_attributes: status=%s body_start=%s",
+                    resp.status_code, resp.text[:120])
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -505,13 +572,14 @@ def _mock_iam_push(config: dict, operation: str) -> dict:
 
 def log_llm_usage(operation: str, provider: str, model: str, prompt_tokens: int,
                   completion_tokens: int, duration_ms: int, success: bool):
-    """Log a single LLM call's token usage and estimated cost to the DB."""
+    """Log a single LLM call's token usage and estimated cost."""
     cost_per_1k = {
-        "gpt-4o":          {"prompt": 0.005,   "completion": 0.015},
-        "gemini-1.5-pro":  {"prompt": 0.00125, "completion": 0.005},
+        "gpt-4o":           {"prompt": 0.005,    "completion": 0.015},
+        "gemini-2.0-flash": {"prompt": 0.000075, "completion": 0.0003},
     }
     rates = cost_per_1k.get(model, {"prompt": 0.005, "completion": 0.015})
     cost = (prompt_tokens / 1000 * rates["prompt"]) + (completion_tokens / 1000 * rates["completion"])
+    total = prompt_tokens + completion_tokens
 
     try:
         conn = get_db_connection()
@@ -522,12 +590,16 @@ def log_llm_usage(operation: str, provider: str, model: str, prompt_tokens: int,
                  total_tokens, estimated_cost_usd, duration_ms, success)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (operation, provider, model, prompt_tokens, completion_tokens,
-              prompt_tokens + completion_tokens, cost, duration_ms, success))
+              total, cost, duration_ms, success))
         conn.commit()
         cur.close()
         conn.close()
     except Exception:
         pass  # Never let logging failures break the main operation
+
+
+def _rows_to_dicts(rows) -> list[dict]:
+    return [dict(r) for r in rows]
 
 
 def get_usage_summary() -> dict:
@@ -537,19 +609,17 @@ def get_usage_summary() -> dict:
         cur = conn.cursor()
         cur.execute("""
             SELECT operation,
-                   SUM(total_tokens)        AS tokens,
-                   SUM(estimated_cost_usd)  AS cost,
-                   COUNT(*)                 AS calls
+                   SUM(total_tokens)       AS tokens,
+                   SUM(estimated_cost_usd) AS cost,
+                   COUNT(*)                AS calls
             FROM llm_usage_logs
             WHERE created_at >= NOW() - INTERVAL '30 days'
-            GROUP BY operation
-            ORDER BY cost DESC
+            GROUP BY operation ORDER BY cost DESC
         """)
-        by_op = [dict(r) for r in cur.fetchall()]
-
+        by_op = _rows_to_dicts(cur.fetchall())
         cur.execute("""
-            SELECT COALESCE(SUM(total_tokens), 0)       AS total_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) AS total_cost
+            SELECT COALESCE(SUM(total_tokens),0)      AS total_tokens,
+                   COALESCE(SUM(estimated_cost_usd),0) AS total_cost
             FROM llm_usage_logs
             WHERE created_at >= NOW() - INTERVAL '30 days'
         """)
@@ -557,12 +627,12 @@ def get_usage_summary() -> dict:
         cur.close()
         conn.close()
         return {
-            "by_operation": by_op,
-            "total_tokens": int(totals["total_tokens"]),
+            "by_operation":  by_op,
+            "total_tokens":  int(totals["total_tokens"]),
             "total_cost_usd": float(totals["total_cost"]),
         }
     except Exception:
-        return _mock_usage_summary()
+        return {"by_operation": [], "total_tokens": 0, "total_cost_usd": 0.0}
 
 
 def get_usage_by_provider() -> list:
@@ -577,15 +647,14 @@ def get_usage_by_provider() -> list:
                    COUNT(*)                AS calls
             FROM llm_usage_logs
             WHERE created_at >= NOW() - INTERVAL '30 days'
-            GROUP BY llm_provider, model
-            ORDER BY cost DESC
+            GROUP BY llm_provider, model ORDER BY cost DESC
         """)
-        rows = [dict(r) for r in cur.fetchall()]
+        rows = _rows_to_dicts(cur.fetchall())
         cur.close()
         conn.close()
         return rows
     except Exception:
-        return _mock_usage_by_provider()
+        return []
 
 
 def get_usage_timeline() -> list:
@@ -599,15 +668,14 @@ def get_usage_timeline() -> list:
                    SUM(estimated_cost_usd) AS cost
             FROM llm_usage_logs
             WHERE created_at >= NOW() - INTERVAL '30 days'
-            GROUP BY DATE(created_at)
-            ORDER BY date
+            GROUP BY DATE(created_at) ORDER BY date
         """)
-        rows = [dict(r) for r in cur.fetchall()]
+        rows = _rows_to_dicts(cur.fetchall())
         cur.close()
         conn.close()
-        return rows
+        return [{"date": str(r["date"]), "tokens": r["tokens"], "cost": r["cost"]} for r in rows]
     except Exception:
-        return _mock_usage_timeline()
+        return []
 
 
 def get_recent_usage(limit: int = 50) -> list:
@@ -618,14 +686,12 @@ def get_recent_usage(limit: int = 50) -> list:
         cur.execute("""
             SELECT operation, llm_provider, model, prompt_tokens, completion_tokens,
                    total_tokens, estimated_cost_usd, duration_ms, success, created_at
-            FROM llm_usage_logs
-            ORDER BY created_at DESC
-            LIMIT %s
+            FROM llm_usage_logs ORDER BY created_at DESC LIMIT %s
         """, (limit,))
-        rows = [dict(r) for r in cur.fetchall()]
+        rows = _rows_to_dicts(cur.fetchall())
         cur.close()
         conn.close()
-        return rows
+        return [dict(r) for r in rows]
     except Exception:
         return []
 
@@ -673,31 +739,6 @@ def scan_all_certificates() -> list[dict]:
             "certificate_status": expiry_info,
         })
     return results
-
-
-def log_cert_alerts(expiring: list):
-    """Persist certificate expiry alerts to the cert_alerts table."""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        for item in expiring:
-            cs = item["certificate_status"]
-            domains = item.get("email_domains") or []
-            primary_domain = domains[0] if domains else ""
-            cur.execute("""
-                INSERT INTO cert_alerts (idp_name, email_domain, days_remaining, expiry_date, created_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (email_domain) DO UPDATE
-                    SET days_remaining = EXCLUDED.days_remaining,
-                        expiry_date    = EXCLUDED.expiry_date,
-                        created_at     = NOW()
-            """, (item["idp_name"], primary_domain,
-                  cs.get("days_remaining"), cs.get("expiry_date")))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception:
-        pass
 
 
 # ── Mock usage data (for prototyping without live DB) ────────────────────────

@@ -1,0 +1,33 @@
+environmentVariables:
+  VITE_API_URL:
+    value: 'https://idp-agent-api.apps.app01.dev-use1.int-kfone.com'
+  VITE_KEYCLOAK_ENABLED:
+    value: 'true'
+  VITE_KEYCLOAK_URL:
+    value: ''
+  VITE_KEYCLOAK_REALM:
+    value: ''
+  VITE_KEYCLOAK_CLIENT:
+    value: 'idp-agent-ui'
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: 5173
+    scheme: HTTP
+  initialDelaySeconds: 10
+  timeoutSeconds: 3
+  periodSeconds: 10
+  successThreshold: 1
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: 5173
+    scheme: HTTP
+  initialDelaySeconds: 10
+  timeoutSeconds: 3
+  periodSeconds: 5
+  successThreshold: 1
+  failureThreshold: 3

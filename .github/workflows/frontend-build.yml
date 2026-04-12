@@ -1,0 +1,58 @@
+name: kf-talentsuite-platform-agent-frontend-build
+run-name: kf-talentsuite-platform-agent-frontend-build-${{ inputs.environment }}-${{ inputs.region }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: "Environment"
+        required: true
+        default: dev
+        options:
+          - sbx
+          - dev
+          - qa1
+      region:
+        type: choice
+        description: "AWS Region"
+        required: true
+        default: us-east-1
+        options:
+          - us-east-1
+          - eu-central-1
+          - eu-west-1
+          - us-west-2
+      patchNumber:
+        description: "Patch number for the release (e.g. rc/v24.1.0.0-ui-123456789)"
+        required: true
+        default: '0'
+      serviceName:
+        type: string
+        description: "Service component tag (e.g. ui)"
+        required: false
+        default: 'ui'
+
+jobs:
+  Build:
+    uses: HayGroup/kfone-common/.github/workflows/docker-build-push-0.0.1.yml@main
+    secrets: inherit
+    with:
+      dockerBaseImage: "node:20-alpine"
+      dockerRepository: "kfone-idp-agent/ui"
+      environment: "${{ inputs.environment }}"
+      workspace: "frontend"
+      dockerFile: "Dockerfile"
+
+  Tagging:
+    name: Build Tag
+    needs: [Build]
+    if: ${{ inputs.environment == 'qa1' }}
+    uses: HayGroup/kfone-common/.github/workflows/create-build-tag-0.0.1.yml@main
+    secrets: inherit
+    with:
+      environment: "${{ inputs.environment }}"
+      region: "${{ inputs.region }}"
+      imageTag: "${{ needs.Build.outputs.imageTag }}"
+      patchNumber: ${{ inputs.patchNumber }}
+      serviceName: ${{ inputs.serviceName }}

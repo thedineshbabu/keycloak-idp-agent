@@ -1,292 +1,183 @@
-# Implementation Plan — Top 3 Quick Wins
+# Plan: Replace SQLite with PostgreSQL-only + yuniql Migrations
+
+## Context
+
+The app currently has a dual-database pattern in `tools.py`: it tries PostgreSQL and silently falls back to SQLite (`usage.db`). This causes problems:
+- `chat_history` only exists in SQLite — lost on container restart
+- `cert_alerts` only works with PostgreSQL — no fallback
+- `idp_configurations` is referenced but never defined in the schema
+- Every DB function maintains two code paths (PostgreSQL `%s` + SQLite `?`)
+
+The goal is to eliminate SQLite entirely, make PostgreSQL the sole database, and set up yuniql migrations following the `kfone-iam-service` reference pattern.
 
 ---
 
-## Item 1: Token Usage Monitoring Dashboard
+## Step 1: Create yuniql directory structure
 
-### Goal
-Track LLM token consumption per operation, per model, and over time. Visualize costs in the React UI.
+Create `yuniql/scripts/` tree with placeholder dirs and initial migration:
 
-### Backend Changes
-
-#### 1. PostgreSQL — New Table
-```sql
-CREATE TABLE llm_usage_logs (
-    id SERIAL PRIMARY KEY,
-    operation VARCHAR(100),        -- e.g. "onboard_idp", "chat", "update_idp"
-    llm_provider VARCHAR(50),      -- "openai" or "gemini"
-    model VARCHAR(100),            -- "gpt-4o", "gemini-1.5-pro"
-    prompt_tokens INT,
-    completion_tokens INT,
-    total_tokens INT,
-    estimated_cost_usd NUMERIC(10, 6),
-    duration_ms INT,
-    success BOOLEAN,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
+```
+yuniql/scripts/
+  Dockerfile                      # FROM yuniql/yuniql:v1.3.69
+  _init/.gitignore                # empty placeholder
+  _pre/.gitignore
+  _post/.gitignore
+  _draft/.gitignore
+  _erase/.gitignore
+  v0.00/
+    README.md                     # describes initial schema
+    01_create_schema.sql          # CREATE SCHEMA IF NOT EXISTS idp_agent
+    02_llm_usage_logs.sql         # from schema.sql + audit columns
+    03_cert_alerts.sql            # from schema.sql + audit columns
+    04_chat_history.sql           # NEW — ported from SQLite _sqlite_conn()
+    05_idp_configurations.sql     # NEW — matches columns used in fetch_existing_idps()
 ```
 
-#### 2. tools.py — Add logging helper
-```python
-def log_llm_usage(operation, provider, model, prompt_tokens, completion_tokens, duration_ms, success):
-    cost_per_1k = {
-        "gpt-4o": {"prompt": 0.005, "completion": 0.015},
-        "gemini-1.5-pro": {"prompt": 0.00125, "completion": 0.005}
-    }
-    rates = cost_per_1k.get(model, {"prompt": 0.005, "completion": 0.015})
-    cost = (prompt_tokens / 1000 * rates["prompt"]) + (completion_tokens / 1000 * rates["completion"])
-    # Insert into llm_usage_logs table
-```
+**Schema name:** `idp_agent`
 
-#### 3. agent.py — Wrap LLM calls
-- Capture token usage from API response (`usage.prompt_tokens`, `usage.completion_tokens`)
-- Record start/end time for duration
-- Call `log_llm_usage()` after every LLM call
+**Tables in v0.00:**
 
-#### 4. main.py — New endpoints
-```
-GET /usage/summary        — total tokens and cost by operation (last 30 days)
-GET /usage/by-provider    — breakdown by OpenAI vs Gemini
-GET /usage/timeline       — daily token usage over time
-GET /usage/operations     — most expensive operations ranked
-```
+| Table | Source | Notes |
+|-------|--------|-------|
+| `llm_usage_logs` | Existing `schema.sql` line 5-17 | Add audit columns (created_by, updated_by, etc.) |
+| `cert_alerts` | Existing `schema.sql` line 23-30 | Add audit columns |
+| `chat_history` | SQLite-only `_sqlite_conn()` line 63-73 | Port to PostgreSQL types |
+| `idp_configurations` | Referenced at `tools.py:144-148` but never defined | Derive columns from SELECT + mock data |
 
-### Frontend Changes
-
-#### New "Usage" view in sidebar
-- **Summary cards** — total tokens today, total cost this month, most used model
-- **Bar chart** — tokens per operation type
-- **Line chart** — daily usage over last 30 days
-- **Table** — recent LLM calls with operation, model, tokens, cost, duration
-
-### Effort Estimate
-- Backend: 2-3 hours
-- Frontend: 2 hours
-- Total: ~4-5 hours
+All SQL uses `IF NOT EXISTS` / `ON CONFLICT DO NOTHING` for idempotency (kfone-iam-service convention).
 
 ---
 
-## Item 2: Keycloak SSO Login
+## Step 2: Remove SQLite from `tools.py`
 
-### Goal
-Protect the agentic app behind Keycloak SSO. Users log in via your existing Keycloak server. Role-based access controls what operations a user can perform.
+**File:** `tools.py`
 
-### Architecture
-```
-React App  →  Keycloak Login Page  →  JWT Token  →  FastAPI validates token
-```
+| What | Lines | Action |
+|------|-------|--------|
+| `import sqlite3` | 8 | Remove |
+| `_SQLITE_PATH` | 31 | Remove |
+| `get_db_connection()` | 36-42 | Rewrite: PostgreSQL-only, add `search_path=idp_agent,public` via connection options |
+| `_sqlite_conn()` | 45-76 | Delete entirely |
+| `save_chat_message()` | 81-94 | Rewrite: `%s` params, use `get_db_connection()` |
+| `get_chat_sessions()` | 97-118 | Rewrite: `%s` params, use `get_db_connection()` |
+| `get_session_messages()` | 121-134 | Rewrite: `%s` params, use `get_db_connection()` |
+| `fetch_existing_idps()` | 137-157 | Simplify: remove `kind != "postgres"` guard |
+| `fetch_idp_by_domain()` | 160-190 | Simplify: remove `kind != "postgres"` guard |
+| `log_llm_usage()` | 614-651 | Remove SQLite else-branch (lines 639-649) |
+| `get_usage_summary()` | 658-707 | Remove SQLite else-branch (lines 682-699) |
+| `get_usage_by_provider()` | 710-741 | Remove SQLite else-branch (lines 727-738) |
+| `get_usage_timeline()` | 744-773 | Remove SQLite else-branch (lines 760-770) |
+| `get_recent_usage()` | 776-798 | Remove SQLite else-branch (lines 789-796) |
+| `log_cert_alerts()` | 847-871 | Remove `kind != "postgres"` early-return guard |
 
-### Keycloak Setup (one-time)
-1. Create a new client in Keycloak: `idp-agent-ui`
-   - Protocol: `openid-connect`
-   - Access Type: `public` (for React SPA)
-   - Valid Redirect URIs: `http://localhost:5173/*`
-   - Web Origins: `http://localhost:5173`
-2. Create roles on the client:
-   - `agent-admin` — full access (onboard, update, troubleshoot)
-   - `agent-viewer` — read-only (query IDPs, view usage)
-3. Assign roles to users
+**Key detail:** `get_db_connection()` will set `search_path=idp_agent,public` via psycopg2 `options` param, so all existing bare table names in SQL queries continue to work without prefixing.
 
-### Frontend Changes
+---
 
-#### Install keycloak-js
+## Step 3: Update `docker-compose.yml`
+
+- Remove `schema.sql` volume mount (line 13: `./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro`)
+- Replace with: `./yuniql/scripts/v0.00:/docker-entrypoint-initdb.d:ro` — Postgres auto-runs the numbered `.sql` files on init
+
+---
+
+## Step 4: Update `Dockerfile`
+
+- Remove `COPY schema.sql ./` (line 15-16) — backend container doesn't need schema at runtime
+
+---
+
+## Step 5: Delete `schema.sql` and `usage.db`
+
+- Delete `schema.sql` — superseded by `yuniql/scripts/v0.00/`
+- Delete `usage.db` — SQLite artifact
+- Add `*.db` to `.gitignore`
+
+---
+
+## Step 6: Update `database-deploy.yml` workflow
+
+**File:** `.github/workflows/database-deploy.yml`
+
+Replace `psql -f schema.sql` with yuniql CLI:
+1. Install yuniql v1.1.55
+2. Create `idp_agent` schema via psql
+3. Run `yuniql init && yuniql run -p './scripts' --meta-table db_migration_yuniql_idp_agent --platform postgresql`
+4. Use `SslMode=Require;TrustServerCertificate=true` for production
+
+---
+
+## Step 7: Create `database-scripts-unit-test.yml` workflow
+
+**New file:** `.github/workflows/database-scripts-unit-test.yml`
+
+- Triggers on PR/push to main, develop, rc/v**
+- Spins up PostgreSQL 16 service container
+- Creates `idp_agent` schema
+- Runs yuniql migrations
+- Validates all scripts apply cleanly
+
+---
+
+## Step 8: Update `ci.yml` workflow
+
+Replace `psql -f schema.sql` in the "Initialise database" step with:
 ```bash
-npm install keycloak-js
+psql -c "CREATE SCHEMA IF NOT EXISTS idp_agent;"
+psql -c "ALTER ROLE iam_user SET search_path TO idp_agent, public;"
+for f in yuniql/scripts/v0.00/*.sql; do psql -f "$f"; done
 ```
-
-#### src/keycloak.js
-```javascript
-import Keycloak from 'keycloak-js';
-
-const keycloak = new Keycloak({
-  url: 'https://your-keycloak-server/auth',
-  realm: 'your-realm',
-  clientId: 'idp-agent-ui'
-});
-
-export default keycloak;
-```
-
-#### src/main.jsx — Init Keycloak before render
-```javascript
-keycloak.init({ onLoad: 'login-required' }).then(authenticated => {
-  if (authenticated) ReactDOM.render(<App keycloak={keycloak} />);
-});
-```
-
-#### App.jsx — Role-based UI
-```javascript
-const isAdmin = keycloak.hasRealmRole('agent-admin');
-const isViewer = keycloak.hasRealmRole('agent-viewer');
-
-// Hide "Run Agent" buttons for viewers
-// Show user name and logout in header
-```
-
-### Backend Changes
-
-#### Install python-jose
-```bash
-pip install python-jose[cryptography]
-```
-
-#### auth.py — JWT validation middleware
-```python
-from fastapi import Depends, HTTPException, Header
-from jose import jwt
-
-KEYCLOAK_CERTS_URL = "https://your-keycloak/auth/realms/your-realm/protocol/openid-connect/certs"
-
-async def verify_token(authorization: str = Header(...)):
-    token = authorization.replace("Bearer ", "")
-    # Fetch Keycloak public keys and validate JWT
-    # Extract roles from token claims
-    # Return user context
-    return user_context
-```
-
-#### Protect endpoints
-```python
-@app.post("/onboard")
-async def onboard_idp(req: OnboardRequest, user=Depends(verify_token)):
-    if "agent-admin" not in user["roles"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
-    ...
-```
-
-### Effort Estimate
-- Keycloak config: 30 mins
-- Frontend auth: 2 hours
-- Backend JWT validation: 1.5 hours
-- Total: ~4 hours
 
 ---
 
-## Item 3: Certificate & Secret Rotation Automation
+## Step 9: Update documentation
 
-### Goal
-Proactively detect expiring certificates across all client IDPs, alert before they expire, and support manual or automated rotation from the UI.
-
-### Backend Changes
-
-#### tools.py — New tool functions
-
-```python
-import ssl
-import base64
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-from datetime import datetime, timezone, timedelta
-
-def parse_certificate_expiry(cert_pem: str) -> dict:
-    """Parse a PEM or base64 certificate and return expiry info."""
-    try:
-        # Handle both PEM and raw base64
-        if "BEGIN CERTIFICATE" not in cert_pem:
-            cert_pem = f"-----BEGIN CERTIFICATE-----\n{cert_pem}\n-----END CERTIFICATE-----"
-        cert_bytes = cert_pem.encode()
-        cert = x509.load_pem_x509_certificate(cert_bytes, default_backend())
-        expiry = cert.not_valid_after_utc
-        days_remaining = (expiry - datetime.now(timezone.utc)).days
-        return {
-            "expiry_date": expiry.isoformat(),
-            "days_remaining": days_remaining,
-            "subject": cert.subject.rfc4514_string(),
-            "issuer": cert.issuer.rfc4514_string(),
-            "status": "critical" if days_remaining < 14 else "warning" if days_remaining < 30 else "ok"
-        }
-    except Exception as e:
-        return {"error": str(e), "status": "unknown"}
-
-
-def scan_all_certificates() -> list[dict]:
-    """Scan all IDP configs and return certificate status for each."""
-    idps = fetch_existing_idps()
-    results = []
-    for idp in idps:
-        cert = idp.get("certificate") or idp.get("signing_certificate")
-        if cert:
-            expiry_info = parse_certificate_expiry(cert)
-            results.append({
-                "idp_name": idp["idp_name"],
-                "email_domain": idp["email_domain"],
-                "certificate_status": expiry_info
-            })
-    return results
-```
-
-#### main.py — New endpoints
-```
-GET  /certificates/scan          — scan all IDPs and return cert status
-GET  /certificates/expiring      — return only IDPs with certs expiring < 30 days
-POST /certificates/rotate        — accept new cert for a domain and push to IAM
-POST /certificates/schedule-scan — schedule automated daily scans
-```
-
-#### Scheduled scanner (APScheduler)
-```python
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-scheduler = AsyncIOScheduler()
-
-@scheduler.scheduled_job('cron', hour=8)  # Run daily at 8am
-async def daily_cert_scan():
-    results = scan_all_certificates()
-    expiring = [r for r in results if r["certificate_status"].get("days_remaining", 999) < 30]
-    if expiring:
-        # Log to DB, optionally send alert webhook
-        log_cert_alerts(expiring)
-```
-
-### Frontend Changes
-
-#### New "Certificates" view in sidebar
-
-**Certificate Health Dashboard:**
-- **Status grid** — all IDPs with color-coded cert status (green/yellow/red)
-- **Expiry timeline** — visual showing which certs expire when
-- **Critical alerts** — banner for certs expiring within 14 days
-
-**Rotate Certificate panel:**
-- Select IDP by email domain
-- Paste new certificate
-- Agent validates, simulates, and pushes to IAM
-- Confirmation with old vs new expiry dates shown
-
-#### Certificate status card component
-```jsx
-function CertStatusCard({ idp_name, domain, status }) {
-  const color = status === "critical" ? RED : status === "warning" ? AMBER : GREEN;
-  return (
-    <div style={{ borderLeft: `3px solid ${color}`, padding: "12px" }}>
-      <div>{idp_name} — {domain}</div>
-      <div>{status.days_remaining} days remaining</div>
-      <div>Expires: {status.expiry_date}</div>
-    </div>
-  );
-}
-```
-
-### Install dependency
-```bash
-pip install cryptography apscheduler
-```
-
-### Effort Estimate
-- Certificate parsing + scan tool: 2 hours
-- Scheduled scanner: 1 hour
-- New API endpoints: 1 hour
-- Frontend dashboard: 2-3 hours
-- Total: ~6-7 hours
+- **CLAUDE.md:** Update DB commands, remove SQLite fallback mention
+- **README.md:** Update file tree, replace schema.sql references with yuniql
+- **.gitignore:** Add `*.db`
 
 ---
 
-## Summary
+## Files to modify
 
-| Item | Effort | Dependencies | Start With |
-|------|--------|--------------|------------|
-| Token Usage Dashboard | ~4-5 hrs | None — uses existing DB + LLM calls | ✅ Yes |
-| Keycloak SSO Login | ~4 hrs | Keycloak client setup | ✅ Yes |
-| Certificate Rotation | ~6-7 hrs | `cryptography`, `apscheduler` | After the above two |
+| File | Action |
+|------|--------|
+| `tools.py` | Major rewrite — remove all SQLite code |
+| `docker-compose.yml` | Swap volume mount |
+| `Dockerfile` | Remove schema.sql COPY |
+| `.github/workflows/database-deploy.yml` | Replace psql with yuniql |
+| `.github/workflows/ci.yml` | Update DB init step |
+| `.gitignore` | Add `*.db` |
+| `CLAUDE.md` | Update DB docs |
+| `schema.sql` | Delete |
+| `usage.db` | Delete |
 
-**Recommended order:** Token Dashboard → SSO Login → Certificate Rotation
+## New files
+
+| File | Purpose |
+|------|---------|
+| `yuniql/scripts/Dockerfile` | Yuniql container image |
+| `yuniql/scripts/_init/.gitignore` | Placeholder |
+| `yuniql/scripts/_pre/.gitignore` | Placeholder |
+| `yuniql/scripts/_post/.gitignore` | Placeholder |
+| `yuniql/scripts/_draft/.gitignore` | Placeholder |
+| `yuniql/scripts/_erase/.gitignore` | Placeholder |
+| `yuniql/scripts/v0.00/README.md` | Migration docs |
+| `yuniql/scripts/v0.00/01_create_schema.sql` | Schema creation |
+| `yuniql/scripts/v0.00/02_llm_usage_logs.sql` | LLM usage table |
+| `yuniql/scripts/v0.00/03_cert_alerts.sql` | Cert alerts table |
+| `yuniql/scripts/v0.00/04_chat_history.sql` | Chat history table |
+| `yuniql/scripts/v0.00/05_idp_configurations.sql` | IDP configs table |
+| `.github/workflows/database-scripts-unit-test.yml` | DB migration CI |
+
+---
+
+## Verification
+
+1. `docker compose up --build` — Postgres starts, v0.00 scripts run, backend connects
+2. Hit `/health` endpoint — returns 200
+3. Hit `/chat` — chat messages save to PostgreSQL `chat_history` (not SQLite)
+4. Hit `/usage/summary` — returns data from PostgreSQL `llm_usage_logs`
+5. Confirm `usage.db` is not created anywhere
+6. `grep -r sqlite3 *.py` — returns nothing
+7. Run the database-scripts-unit-test workflow — yuniql applies cleanly

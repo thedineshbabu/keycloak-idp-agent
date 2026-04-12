@@ -1,5 +1,5 @@
 """
-IDP Agent Core
+Talent Suite Platform Agent — Agent Core
 Orchestrates LLM calls + tool execution for IDP onboarding and updates.
 Supports OpenAI and Google Gemini.
 """
@@ -77,7 +77,7 @@ class IDPAgent:
 
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
                     json={
                         "system_instruction": {"parts": [{"text": system}]},
                         "contents": contents,
@@ -93,7 +93,7 @@ class IDPAgent:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
         finally:
             duration_ms = int((time.time() - start) * 1000)
-            log_llm_usage(operation, "gemini", "gemini-1.5-pro", prompt_tokens, completion_tokens,
+            log_llm_usage(operation, "gemini", "gemini-2.0-flash", prompt_tokens, completion_tokens,
                           duration_ms, success)
 
     async def _llm(self, messages: list, provider: str = "openai",
