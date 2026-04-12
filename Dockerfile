@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY main.py agent.py skill.py tools.py auth.py \
      keycloak_admin.py policy_engine.py platform_api.py chat_engine.py \
+     datadog_api.py \
      ./
 
 EXPOSE 8000
