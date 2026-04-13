@@ -863,8 +863,9 @@ class UnifiedChatEngine:
     using LLM function-calling. Runs an agentic loop (up to 5 tool-call rounds).
     """
 
-    def __init__(self, kc_admin: KeycloakAdminClient):
+    def __init__(self, kc_admin: KeycloakAdminClient, context_engine=None):
         self.kc = kc_admin
+        self.context_engine = context_engine
 
     async def chat(
         self,
@@ -885,6 +886,22 @@ class UnifiedChatEngine:
         """
         tools = _TOOLS + (_DD_TOOLS if dd_available() else [])
         system_prompt = SYSTEM_PROMPT + (_DD_SYSTEM_PROMPT_SECTION if dd_available() else "")
+
+        # ── RAG context injection ────────────────────────────────────────────
+        if self.context_engine and self.context_engine.is_ready:
+            try:
+                relevant_context = await self.context_engine.get_relevant_context(message)
+                platform_summary = self.context_engine.get_summary()
+                rag_block = platform_summary + "\n\n"
+                if relevant_context:
+                    rag_block += (
+                        "--- Relevant Platform Context ---\n"
+                        + relevant_context
+                        + "\n--- End Context ---\n\n"
+                    )
+                system_prompt = rag_block + system_prompt
+            except Exception:
+                pass  # fall through with original system_prompt
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-20:])   # up to last 10 turns for context
