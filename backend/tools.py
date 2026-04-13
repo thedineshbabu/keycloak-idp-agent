@@ -741,6 +741,108 @@ def scan_all_certificates() -> list[dict]:
     return results
 
 
+# ── Realm snapshot helpers ───────────────────────────────────────────────────
+
+import json as _json
+
+
+def save_realm_snapshot(realm: str, label: str, snapshot: dict, created_by: str) -> dict:
+    """Persist a realm partial-export snapshot to the database."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO realm_snapshots (realm, label, snapshot, created_by)
+        VALUES (%s, %s, %s::jsonb, %s)
+        RETURNING id, realm, label, created_at, created_by
+        """,
+        (realm, label or f"{realm} snapshot", _json.dumps(snapshot), created_by),
+    )
+    row = dict(cur.fetchone())
+    row["created_at"] = row["created_at"].isoformat()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
+def list_realm_snapshots(realm: str) -> list:
+    """List all snapshots for a realm (newest first), without the full JSON."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, realm, label, created_at, created_by,
+                   pg_column_size(snapshot) AS size_bytes
+            FROM realm_snapshots
+            WHERE realm = %s
+            ORDER BY created_at DESC
+            """,
+            (realm,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [
+            {
+                "id": r["id"],
+                "realm": r["realm"],
+                "label": r["label"],
+                "created_at": r["created_at"].isoformat(),
+                "created_by": r["created_by"],
+                "size_bytes": r["size_bytes"],
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+def get_realm_snapshot(snapshot_id: int) -> Optional[dict]:
+    """Return a single snapshot record including its full JSON."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, realm, label, snapshot, created_at, created_by
+            FROM realm_snapshots WHERE id = %s
+            """,
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "realm": row["realm"],
+            "label": row["label"],
+            "snapshot": row["snapshot"],
+            "created_at": row["created_at"].isoformat(),
+            "created_by": row["created_by"],
+        }
+    except Exception:
+        return None
+
+
+def delete_realm_snapshot(snapshot_id: int) -> bool:
+    """Delete a snapshot by ID. Returns True if a row was deleted."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM realm_snapshots WHERE id = %s", (snapshot_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
+    except Exception:
+        return False
+
+
 # ── Mock usage data (for prototyping without live DB) ────────────────────────
 
 def _mock_usage_summary() -> dict:
