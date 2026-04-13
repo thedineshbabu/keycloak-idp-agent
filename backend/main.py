@@ -140,7 +140,14 @@ _context_docs_path = os.getenv(
     "PLATFORM_DOCS_PATH",
     str(pathlib.Path(__file__).resolve().parent.parent / "PLATFORM_CONTEXT.md"),
 )
-context_engine = EmbeddingContextEngine(docs_path=_context_docs_path)
+_embedding_cache_path = os.getenv(
+    "EMBEDDING_CACHE_PATH",
+    str(pathlib.Path(__file__).resolve().parent / ".cache" / "embeddings.pkl"),
+)
+context_engine = EmbeddingContextEngine(
+    docs_path=_context_docs_path,
+    cache_path=_embedding_cache_path,
+)
 unified_engine = UnifiedChatEngine(kc_admin, context_engine=context_engine)
 
 
