@@ -7,3 +7,5 @@ cryptography
 apscheduler
 pydantic
 python-dotenv
+numpy
+scikit-learn

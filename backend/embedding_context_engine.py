@@ -1,0 +1,123 @@
+"""
+Embedding Context Engine
+Vectorises PLATFORM_CONTEXT.md on startup.
+On each query, semantically searches for the most relevant sections
+and returns them as context for the LLM prompt.
+"""
+
+import logging
+import os
+import re
+
+import httpx
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+log = logging.getLogger(__name__)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+PLATFORM_SUMMARY = (
+    "You are an intelligent assistant for the Talents Suite Platform.\n"
+    "The platform serves 2,000+ enterprise clients with SSO authentication via Keycloak.\n"
+    "You have access to live data sources: Core Service (client data), IAM Service\n"
+    "(identity configs, users, roles), and Keycloak Admin API (realms, policies, users).\n"
+    "Always use live API data to answer questions. Be specific and reference exact values."
+)
+
+_EMBED_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "text-embedding-004:embedContent?key={key}"
+)
+
+
+class EmbeddingContextEngine:
+
+    def __init__(self, docs_path: str = "PLATFORM_CONTEXT.md"):
+        self.docs_path = docs_path
+        self.sections: list[dict] = []
+        self.embeddings: np.ndarray | None = None
+        self._ready = False
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    # ── Startup ──────────────────────────────────────────────────────────────
+
+    async def initialize(self) -> None:
+        """Load the platform doc, split into sections, and embed each one."""
+        if not GEMINI_API_KEY:
+            log.warning("GEMINI_API_KEY not set — context engine disabled")
+            return
+
+        if not os.path.exists(self.docs_path):
+            log.warning("%s not found — context engine disabled", self.docs_path)
+            return
+
+        with open(self.docs_path, encoding="utf-8") as f:
+            content = f.read()
+
+        raw = re.split(r"\n## ", content)
+        self.sections = []
+        for s in raw:
+            lines = s.strip().split("\n")
+            title = lines[0].replace("#", "").strip()
+            body = "\n".join(lines[1:]).strip()
+            if body:
+                self.sections.append({"title": title, "content": body})
+
+        if not self.sections:
+            log.warning("No sections found in %s", self.docs_path)
+            return
+
+        texts = [f"{s['title']}\n{s['content']}" for s in self.sections]
+        self.embeddings = await self._embed_batch(texts)
+        self._ready = True
+        log.info("Embedded %d sections from %s", len(self.sections), self.docs_path)
+
+    # ── Embedding helpers ────────────────────────────────────────────────────
+
+    async def _embed_batch(self, texts: list[str]) -> np.ndarray:
+        embeddings = []
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for text in texts:
+                emb = await self._embed_single(client, text)
+                embeddings.append(emb)
+        return np.array(embeddings)
+
+    async def _embed_single(
+        self, client: httpx.AsyncClient, text: str
+    ) -> list[float]:
+        resp = await client.post(
+            _EMBED_URL.format(key=GEMINI_API_KEY),
+            json={
+                "model": "models/text-embedding-004",
+                "content": {"parts": [{"text": text[:8000]}]},
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["embedding"]["values"]
+
+    # ── Query-time retrieval ─────────────────────────────────────────────────
+
+    async def get_relevant_context(self, query: str, top_k: int = 2) -> str:
+        """Return the *top_k* most relevant sections for *query*."""
+        if not self._ready or self.embeddings is None:
+            return ""
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            query_emb = await self._embed_single(client, query)
+
+        query_vec = np.array(query_emb).reshape(1, -1)
+        sims = cosine_similarity(query_vec, self.embeddings)[0]
+        top_indices = sims.argsort()[-top_k:][::-1]
+
+        parts = []
+        for i in top_indices:
+            sec = self.sections[i]
+            parts.append(f"### {sec['title']}\n{sec['content']}")
+        return "\n\n".join(parts)
+
+    def get_summary(self) -> str:
+        return PLATFORM_SUMMARY
