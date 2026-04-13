@@ -5,12 +5,12 @@ An agentic AI system for managing your Talent Suite Platform — including Keycl
 ## Architecture
 
 ```
-React UI  →  FastAPI Backend  →  Agent Core  →  Tools
-                                     ↓
-                              OpenAI / Gemini LLM
-                                     ↓
-   PostgreSQL  |  Core API (clients, products)  |  IAM API (users, roles)
-                                     ↓
+React UI (frontend/)  →  FastAPI Backend (backend/)  →  Unified Chat Engine  →  51 Tools
+                                    ↓                          ↓
+                             OpenAI / Gemini LLM        RAG Context Engine
+                                    ↓                   (PLATFORM_CONTEXT.md)
+              PostgreSQL  |  Core API  |  IAM API  |  Datadog (optional)
+                                    ↓
                        Keycloak Admin REST API
 ```
 
@@ -37,6 +37,8 @@ React UI  →  FastAPI Backend  →  Agent Core  →  Tools
 ### Other
 - **Keycloak SSO login** — JWT-based auth protecting write endpoints; access token is forwarded dynamically to all Core and IAM API calls; role-based UI (`agent-admin` vs viewer)
 - **Clone IDP config** — Copy all SAML attributes from an existing IDP into a new onboard form; domain is intentionally left blank so you supply new domains
+- **RAG Context Engine** — Embeds `PLATFORM_CONTEXT.md` on startup via Gemini text-embedding-004; injects the most relevant platform documentation sections into every chat prompt for domain-aware answers
+- **Datadog Observability** *(optional)* — Query logs, traces, metrics, monitors, and events via the chat interface when Datadog keys are configured
 - **Mock mode** — Works without a live DB or IAM service for prototyping
 
 ---
@@ -45,18 +47,31 @@ React UI  →  FastAPI Backend  →  Agent Core  →  Tools
 
 ```
 kf-talentsuite-platform-agent/
-├── main.py              # FastAPI app + all endpoints
-├── agent.py             # Agent core (LLM orchestration + usage logging)
-├── skill.py             # IDP skill schema + system prompt
-├── tools.py             # Tool functions (DB, Core API, simulator, usage, certificates, chat)
-├── auth.py              # Keycloak JWT validation middleware
-├── keycloak_admin.py    # Keycloak Admin API client (service account auth)
-├── platform_api.py      # Talent Suite Core & IAM API async HTTP client
-├── policy_engine.py     # LLM-powered policy query engine
-├── keycloak.js          # Frontend Keycloak client config
-├── App.jsx              # React UI (all views)
-└── yuniql/scripts/      # PostgreSQL migrations (yuniql)
-    └── v0.00/           # Initial schema (idp_agent.*)
+├── backend/
+│   ├── main.py                      # FastAPI app + all endpoints
+│   ├── agent.py                     # IDPAgent — LLM orchestration for onboard/update workflows
+│   ├── chat_engine.py               # UnifiedChatEngine — multi-service chat with 51 function-calling tools
+│   ├── embedding_context_engine.py  # RAG context engine (Gemini embeddings + cosine similarity)
+│   ├── skill.py                     # IDP skill schema + system prompt
+│   ├── tools.py                     # DB helpers, Core API, simulator, usage logging, certificates, chat history
+│   ├── auth.py                      # Keycloak JWT validation middleware
+│   ├── keycloak_admin.py            # Keycloak Admin API client (service account auth)
+│   ├── platform_api.py              # Talent Suite Core & IAM API async HTTP client
+│   ├── policy_engine.py             # LLM-powered policy query engine
+│   ├── datadog_api.py               # Datadog logs, traces, metrics, monitors, events (optional)
+│   ├── requirements.txt             # Python dependencies
+│   └── Dockerfile
+├── frontend/
+│   ├── App.jsx                      # React UI (all views)
+│   ├── keycloak.js                  # Keycloak JS adapter config
+│   ├── main.jsx                     # React entry point
+│   ├── vite.config.js
+│   └── Dockerfile
+├── yuniql/scripts/                  # PostgreSQL migrations (yuniql)
+│   └── v0.00/                       # Initial schema (idp_agent.*)
+├── PLATFORM_CONTEXT.md              # Platform documentation for RAG context engine
+├── docker-compose.yml
+└── .env.example
 ```
 
 ---
@@ -86,13 +101,13 @@ PostgreSQL is auto-initialised from the yuniql migration scripts (`yuniql/script
 
 ```bash
 python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+source venv/bin/activate   # or venv\Scripts\activate on Windows
+pip install -r backend/requirements.txt
 
 cp .env.example .env
 # Fill in your values
 
-python main.py
+cd backend && python main.py
 # Runs on http://localhost:8000
 ```
 
@@ -115,8 +130,8 @@ IDP configurations and certificate data are managed via the Core API custom attr
 ### Frontend
 
 ```bash
-npm install
-npm run dev
+cd frontend && npm install
+cd frontend && npm run dev
 # Runs on http://localhost:5173
 ```
 
@@ -130,6 +145,10 @@ npm run dev
 # LLM providers
 OPENAI_API_KEY=
 GEMINI_API_KEY=
+
+# Agent guardrails
+DEFAULT_LLM_PROVIDER=gemini          # openai | gemini
+DAILY_QUERY_LIMIT=10                 # max chat/policy queries per user per day (0 = unlimited)
 
 # PostgreSQL
 DB_HOST=localhost
@@ -160,8 +179,17 @@ KEYCLOAK_CLIENT_ID=your-client-id
 KEYCLOAK_ADMIN_CLIENT_ID=your-service-account-client-id
 KEYCLOAK_ADMIN_CLIENT_SECRET=your-client-secret
 
+# RAG Context Engine (optional — omit to disable)
+PLATFORM_DOCS_PATH=                  # default: PLATFORM_CONTEXT.md in repo root
+
+# Datadog (optional — omit to disable observability tools in chat)
+DATADOG_API_KEY=
+DATADOG_APP_KEY=
+DATADOG_SITE=datadoghq.com
+
 # Frontend (Vite)
 VITE_API_URL=http://localhost:8000
+VITE_KEYCLOAK_ENABLED=false
 VITE_KEYCLOAK_URL=https://your-keycloak-server
 VITE_KEYCLOAK_REALM=your-realm
 VITE_KEYCLOAK_CLIENT=your-client-id
@@ -247,12 +275,13 @@ The engine authenticates via `client_credentials` grant and caches the token, re
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/health` | — | Health check |
+| `GET` | `/config` | — | Client-visible config (LLM provider, daily query limit) |
 | `GET` | `/idps` | any | List all IDP configs |
 | `GET` | `/idps/{email_domain}` | any | Fetch a single IDP by email domain |
 | `POST` | `/onboard` | admin | Onboard a new IDP |
 | `POST` | `/onboard-user` | any | Self-service onboard |
 | `POST` | `/update` | admin | Update an existing IDP |
-| `POST` | `/chat` | any | Conversational interface (persists history) |
+| `POST` | `/chat` | any | Conversational interface (persists history, RAG-augmented) |
 | `GET` | `/chat/sessions` | any | List current user's chat sessions |
 | `GET` | `/chat/sessions/{id}` | any | Messages in a session |
 | `GET` | `/skill/schema` | — | IDP field schema |
@@ -337,6 +366,13 @@ The engine authenticates via `client_credentials` grant and caches the token, re
 }
 ```
 
+### Admin (Keycloak Configuration)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/admin/userid-mapper` | admin | Check if userId claim mapper exists on a Keycloak client |
+| `POST` | `/admin/userid-mapper` | admin | Idempotently add userId user-attribute protocol mapper |
+
 ### Core API Proxy (SSO Attributes)
 
 | Method | Path | Auth | Description |
@@ -376,9 +412,12 @@ Each answer shows: question, direct answer block, details, source tags (each Key
 
 ## Extending
 
-- Add new required IDP fields in `skill.py` → `IDP_SKILL_SCHEMA`
-- Add new validation rules in `skill.py` → `VALIDATION_RULES`
-- Add more simulation steps in `tools.py` → `simulate_auth_flow()`
-- Add new Platform API endpoints in `platform_api.py` and wire them in `main.py`
-- Add cost rates for new LLM models in `tools.py` → `log_llm_usage()`
-- Add new Keycloak context sources in `keycloak_admin.py` → `build_context()` for richer policy queries
+- Add new required IDP fields in `backend/skill.py` → `IDP_SKILL_SCHEMA`
+- Add new validation rules in `backend/skill.py` → `VALIDATION_RULES`
+- Add more simulation steps in `backend/tools.py` → `simulate_auth_flow()`
+- Add new Platform API endpoints in `backend/platform_api.py` and wire them in `backend/main.py`
+- Add cost rates for new LLM models in `backend/tools.py` → `log_llm_usage()`
+- Add new Keycloak context sources in `backend/keycloak_admin.py` → `build_context()` for richer policy queries
+- Add new chat tools in `backend/chat_engine.py` → `_TOOLS` list + `_execute_tool()` dispatcher
+- Add new Datadog data sources in `backend/datadog_api.py` + register in `backend/chat_engine.py` (`_DD_TOOLS` + `_execute_tool`)
+- Update platform documentation in `PLATFORM_CONTEXT.md` for the RAG context engine (restart required to re-embed)
