@@ -317,6 +317,82 @@ class KeycloakAdminClient:
                 return {"exists": True, "mapper": m}
         return {"exists": False, "mapper": None}
 
+    # ── Realm export ─────────────────────────────────────────────────────────
+
+    async def export_realm(
+        self,
+        realm: str,
+        export_clients: bool = True,
+        export_groups_roles: bool = True,
+    ) -> dict:
+        """Export a partial realm configuration via Keycloak's partial-export endpoint.
+
+        Returns a RealmRepresentation dict containing IDPs, clients, roles, and
+        groups.  Requires the service account to have the ``realm-management``
+        ``realm-admin`` role (or at minimum ``view-realm`` + ``manage-realm``).
+        """
+        token = await self._get_token(realm)
+        url = f"{KEYCLOAK_URL}/admin/realms/{realm}/partial-export"
+        params = {
+            "exportClients": str(export_clients).lower(),
+            "exportGroupsAndRoles": str(export_groups_roles).lower(),
+        }
+        async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
+            r = await client.post(
+                url,
+                params=params,
+                content=b"",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            r.raise_for_status()
+            return r.json()
+
+    # ── User events & sessions ────────────────────────────────────────────────
+
+    async def get_user_events(
+        self,
+        realm: str,
+        user_id: str,
+        days: int = 30,
+        max_results: int = 200,
+    ) -> list[dict]:
+        """Return Keycloak user events (LOGIN, LOGOUT, LOGIN_ERROR, …) for a user.
+
+        Events are ordered newest-first by Keycloak.
+        """
+        from datetime import datetime, timezone, timedelta
+        date_from = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        return await self._get(realm, "/events", {
+            "user": user_id,
+            "dateFrom": date_from,
+            "max": max_results,
+        })
+
+    async def get_user_sessions(self, realm: str, user_id: str) -> list[dict]:
+        """Return currently active Keycloak sessions for a user."""
+        return await self._get(realm, f"/users/{user_id}/sessions")
+
+    async def get_admin_events_for_user(
+        self,
+        realm: str,
+        user_id: str,
+        days: int = 30,
+        max_results: int = 100,
+    ) -> list[dict]:
+        """Return admin-generated events that targeted a specific user (role
+        assignments, password resets, attribute updates, etc.).
+        """
+        from datetime import datetime, timezone, timedelta
+        date_from = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        return await self._get(realm, "/admin-events", {
+            "resourcePath": f"users/{user_id}*",
+            "dateFrom": date_from,
+            "max": max_results,
+        })
+
     # ── Smart context builder ─────────────────────────────────────────────────
 
     async def build_context(self, realm: str, query: str) -> dict:

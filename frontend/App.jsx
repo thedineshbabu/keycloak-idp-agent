@@ -2867,6 +2867,385 @@ function TokenSetupView() {
   );
 }
 
+// ── Realm Snapshot View ───────────────────────────────────────────────────────
+
+function RealmSnapshotView() {
+  const C = useColors();
+  const S = useStyles();
+  const [realms, setRealms]         = useState([]);
+  const [realm, setRealm]           = useState("");
+  const [label, setLabel]           = useState("");
+  const [snapshots, setSnapshots]   = useState([]);
+  const [taking, setTaking]         = useState(false);
+  const [loading, setLoading]       = useState(false);
+  const [viewSnap, setViewSnap]     = useState(null);  // full snapshot JSON
+  const [loadingSnap, setLoadingSnap] = useState(null);
+  const [error, setError]           = useState("");
+  const [msg, setMsg]               = useState("");
+
+  useEffect(() => {
+    apiFetch("/policy/realms").then(r => r.json()).then(data => {
+      const list = Array.isArray(data) ? data : [];
+      setRealms(list);
+      if (list.length > 0) setRealm(list[0].realm);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (realm) loadSnapshots();
+  }, [realm]);
+
+  async function loadSnapshots() {
+    setLoading(true);
+    setError("");
+    try {
+      const r = await apiFetch(`/admin/snapshots/${realm}`);
+      const data = await r.json();
+      if (!r.ok) { setError(data.detail || "Failed to load snapshots"); return; }
+      setSnapshots(data);
+    } catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
+  }
+
+  async function takeSnapshot() {
+    setTaking(true); setError(""); setMsg("");
+    try {
+      const r = await apiFetch(`/admin/snapshots/${realm}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label: label.trim() || null }),
+      });
+      const data = await r.json();
+      if (!r.ok) { setError(data.detail || "Snapshot failed"); return; }
+      setMsg(`Snapshot saved: ${data.label}`);
+      setLabel("");
+      loadSnapshots();
+    } catch (e) { setError(String(e)); }
+    finally { setTaking(false); }
+  }
+
+  async function viewSnapshot(id) {
+    setLoadingSnap(id);
+    try {
+      const r = await apiFetch(`/admin/snapshots/${realm}/${id}`);
+      const data = await r.json();
+      if (!r.ok) { setError(data.detail || "Failed to load snapshot"); return; }
+      setViewSnap(data);
+    } catch (e) { setError(String(e)); }
+    finally { setLoadingSnap(null); }
+  }
+
+  async function downloadSnapshot(snap) {
+    const r = await apiFetch(`/admin/snapshots/${realm}/${snap.id}`);
+    const data = await r.json();
+    const blob = new Blob([JSON.stringify(data.snapshot, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${realm}-snapshot-${snap.id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function deleteSnapshot(id) {
+    if (!confirm("Delete this snapshot?")) return;
+    const r = await apiFetch(`/admin/snapshots/${realm}/${id}`, { method: "DELETE" });
+    if (r.ok) { loadSnapshots(); setMsg("Snapshot deleted"); }
+    else { const d = await r.json(); setError(d.detail || "Delete failed"); }
+  }
+
+  const fmtDate = (iso) => iso ? new Date(iso).toLocaleString() : "—";
+  const fmtSize = (b) => b ? (b < 1024 ? `${b} B` : `${(b / 1024).toFixed(1)} KB`) : "—";
+
+  const inputStyle = {
+    background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "6px",
+    color: C.text, padding: "8px 12px", fontSize: "12px", outline: "none",
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+      <div style={S.card}>
+        <div style={S.cardTitle}>◈ Realm Snapshots</div>
+        <p style={{ margin: "0 0 16px", fontSize: "12px", color: C.textMuted }}>
+          Export and store a realm&apos;s configuration (clients, IDPs, roles, groups) as a
+          timestamped snapshot. Use it to audit drift or restore a known-good state.
+        </p>
+
+        <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+          <select value={realm} onChange={e => setRealm(e.target.value)}
+            style={{ ...inputStyle, minWidth: "160px" }}>
+            {realms.map(r => <option key={r.realm} value={r.realm}>{r.realm}</option>)}
+          </select>
+          <input placeholder="Label (optional)" value={label}
+            onChange={e => setLabel(e.target.value)}
+            style={{ ...inputStyle, flex: 1, minWidth: "180px" }} />
+          <button style={S.btn("primary")} onClick={takeSnapshot} disabled={taking || !realm}>
+            {taking ? "Taking…" : "Take Snapshot"}
+          </button>
+        </div>
+
+        {error && <div style={{ marginTop: "10px", fontSize: "12px", color: C.error,
+          background: C.error + "18", border: `1px solid ${C.error}44`,
+          borderRadius: "4px", padding: "8px 12px" }}>{error}</div>}
+        {msg && <div style={{ marginTop: "10px", fontSize: "12px", color: C.success,
+          background: C.success + "18", border: `1px solid ${C.success}44`,
+          borderRadius: "4px", padding: "8px 12px" }}>{msg}</div>}
+      </div>
+
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+          marginBottom: "14px" }}>
+          <div style={S.cardTitle}>◈ Saved Snapshots</div>
+          <button style={S.btn("secondary")} onClick={loadSnapshots} disabled={loading}>
+            {loading ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+        {snapshots.length === 0 && !loading && (
+          <div style={{ fontSize: "12px", color: C.textMuted, padding: "16px 0" }}>
+            No snapshots yet for <strong>{realm}</strong>. Take one above.
+          </div>
+        )}
+        {snapshots.map(snap => (
+          <div key={snap.id} style={{ display: "flex", alignItems: "center", gap: "10px",
+            padding: "10px 12px", marginBottom: "6px", borderRadius: "6px",
+            background: C.surfaceAlt, border: `1px solid ${C.border}`, flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: "120px" }}>
+              <div style={{ fontSize: "12px", color: C.text, fontWeight: 600 }}>
+                {snap.label}
+              </div>
+              <div style={{ fontSize: "11px", color: C.textMuted, marginTop: "2px" }}>
+                {fmtDate(snap.created_at)} · {fmtSize(snap.size_bytes)} · by {snap.created_by}
+              </div>
+            </div>
+            <button style={S.btn("secondary")} disabled={loadingSnap === snap.id}
+              onClick={() => viewSnapshot(snap.id)}>
+              {loadingSnap === snap.id ? "Loading…" : "View"}
+            </button>
+            <button style={S.btn("secondary")} onClick={() => downloadSnapshot(snap)}>
+              Download
+            </button>
+            <button style={S.btn("danger")} onClick={() => deleteSnapshot(snap.id)}>
+              Delete
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {viewSnap && (
+        <div style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+            marginBottom: "12px" }}>
+            <div style={S.cardTitle}>◈ {viewSnap.label}</div>
+            <button style={S.btn("secondary")} onClick={() => setViewSnap(null)}>Close</button>
+          </div>
+          <div style={{ fontSize: "11px", color: C.textMuted, marginBottom: "10px" }}>
+            Snapshot #{viewSnap.id} · {fmtDate(viewSnap.created_at)} · by {viewSnap.created_by}
+          </div>
+          <pre style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`,
+            borderRadius: "6px", padding: "14px", fontSize: "10px", color: C.textDim,
+            overflow: "auto", maxHeight: "500px", margin: 0 }}>
+            {JSON.stringify(viewSnap.snapshot, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── User Activity Timeline View ───────────────────────────────────────────────
+
+function UserActivityView() {
+  const C = useColors();
+  const S = useStyles();
+  const [realms, setRealms]         = useState([]);
+  const [realm, setRealm]           = useState("");
+  const [userId, setUserId]         = useState("");
+  const [days, setDays]             = useState(30);
+  const [timeline, setTimeline]     = useState(null);
+  const [sessions, setSessions]     = useState(null);
+  const [loading, setLoading]       = useState(false);
+  const [error, setError]           = useState("");
+
+  useEffect(() => {
+    apiFetch("/policy/realms").then(r => r.json()).then(data => {
+      const list = Array.isArray(data) ? data : [];
+      setRealms(list);
+      if (list.length > 0) setRealm(list[0].realm);
+    }).catch(() => {});
+  }, []);
+
+  async function loadActivity() {
+    if (!userId.trim() || !realm) return;
+    setLoading(true); setError(""); setTimeline(null); setSessions(null);
+    try {
+      const [evtRes, sessRes] = await Promise.all([
+        apiFetch(`/platform/users/${encodeURIComponent(userId.trim())}/activity?realm=${realm}&days=${days}`),
+        apiFetch(`/platform/users/${encodeURIComponent(userId.trim())}/sessions?realm=${realm}`),
+      ]);
+      const evtData  = await evtRes.json();
+      const sessData = await sessRes.json();
+      if (!evtRes.ok) { setError(evtData.detail || "Failed to load activity"); return; }
+      setTimeline(evtData);
+      setSessions(sessRes.ok ? sessData : null);
+    } catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
+  }
+
+  const EVENT_COLORS = {
+    LOGIN:        "#10b981",
+    LOGOUT:       "#64748b",
+    LOGIN_ERROR:  "#ef4444",
+    REGISTER:     "#3b82f6",
+    UPDATE_EMAIL: "#f59e0b",
+    UPDATE_PROFILE: "#f59e0b",
+    UPDATE_PASSWORD: "#f59e0b",
+    RESET_PASSWORD: "#f59e0b",
+    CREATE:       "#3b82f6",
+    UPDATE:       "#f59e0b",
+    DELETE:       "#ef4444",
+    ACTION:       "#8b5cf6",
+  };
+  const evtColor = (type) => EVENT_COLORS[type] || C.textMuted;
+  const evtBg    = (type) => (evtColor(type)) + "20";
+
+  const fmtTs = (ms) => ms ? new Date(ms).toLocaleString() : "—";
+
+  const inputStyle = {
+    background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "6px",
+    color: C.text, padding: "8px 12px", fontSize: "12px", outline: "none",
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+      <div style={S.card}>
+        <div style={S.cardTitle}>◈ User Activity Timeline</div>
+        <p style={{ margin: "0 0 16px", fontSize: "12px", color: C.textMuted }}>
+          View login history, role changes, and admin actions for a Keycloak user.
+          Enter the user&apos;s Keycloak UUID or username.
+        </p>
+        <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+          <select value={realm} onChange={e => setRealm(e.target.value)}
+            style={{ ...inputStyle, minWidth: "140px" }}>
+            {realms.map(r => <option key={r.realm} value={r.realm}>{r.realm}</option>)}
+          </select>
+          <input placeholder="User ID or username" value={userId}
+            onChange={e => setUserId(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && loadActivity()}
+            style={{ ...inputStyle, flex: 1, minWidth: "200px" }} />
+          <select value={days} onChange={e => setDays(Number(e.target.value))}
+            style={{ ...inputStyle, width: "120px" }}>
+            {[7, 14, 30, 60, 90].map(d =>
+              <option key={d} value={d}>Last {d} days</option>)}
+          </select>
+          <button style={S.btn("primary")} onClick={loadActivity}
+            disabled={loading || !userId.trim() || !realm}>
+            {loading ? "Loading…" : "Load Activity"}
+          </button>
+        </div>
+        {error && <div style={{ marginTop: "10px", fontSize: "12px", color: C.error,
+          background: C.error + "18", border: `1px solid ${C.error}44`,
+          borderRadius: "4px", padding: "8px 12px" }}>{error}</div>}
+      </div>
+
+      {sessions && (
+        <div style={S.card}>
+          <div style={S.cardTitle}>◈ Active Sessions</div>
+          {sessions.sessions?.length === 0 ? (
+            <div style={{ fontSize: "12px", color: C.textMuted }}>No active sessions.</div>
+          ) : (
+            sessions.sessions?.map((s, i) => (
+              <div key={i} style={{ padding: "10px 12px", marginBottom: "6px",
+                borderRadius: "6px", background: C.surfaceAlt, border: `1px solid ${C.border}` }}>
+                <div style={{ display: "flex", gap: "16px", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: "11px", color: C.success }}>● Active</span>
+                  <span style={{ fontSize: "11px", color: C.textDim }}>
+                    Started: {fmtTs(s.start)}
+                  </span>
+                  <span style={{ fontSize: "11px", color: C.textDim }}>
+                    Last seen: {fmtTs(s.lastAccess)}
+                  </span>
+                  {s.ipAddress && (
+                    <span style={{ fontSize: "11px", color: C.textMuted }}>
+                      IP: {s.ipAddress}
+                    </span>
+                  )}
+                </div>
+                {s.clients && Object.values(s.clients).length > 0 && (
+                  <div style={{ marginTop: "6px", fontSize: "11px", color: C.textMuted }}>
+                    Clients: {Object.values(s.clients).join(", ")}
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {timeline && (
+        <div style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between",
+            alignItems: "center", marginBottom: "14px" }}>
+            <div style={S.cardTitle}>◈ Event Timeline</div>
+            <span style={{ fontSize: "11px", color: C.textMuted }}>
+              {timeline.events?.length ?? 0} events · last {days} days
+            </span>
+          </div>
+          {timeline.events?.length === 0 && (
+            <div style={{ fontSize: "12px", color: C.textMuted }}>
+              No events found for this user in the selected period.
+            </div>
+          )}
+          {timeline.events?.map((ev, i) => (
+            <div key={i} style={{ display: "flex", gap: "12px", padding: "8px 0",
+              borderBottom: `1px solid ${C.border}30`, alignItems: "flex-start" }}>
+              <div style={{ minWidth: "130px", fontSize: "10px", color: C.textMuted,
+                paddingTop: "2px", flexShrink: 0 }}>
+                {fmtTs(ev.timestamp)}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px", flex: 1 }}>
+                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                  <span style={{ fontSize: "11px", fontWeight: 700, padding: "2px 8px",
+                    borderRadius: "4px", background: evtBg(ev.type), color: evtColor(ev.type),
+                    letterSpacing: "0.04em" }}>
+                    {ev.type}
+                  </span>
+                  {ev.source === "admin" && (
+                    <span style={{ fontSize: "10px", color: C.textMuted }}>
+                      admin action by {ev.actor || "unknown"}
+                    </span>
+                  )}
+                  {ev.client && (
+                    <span style={{ fontSize: "10px", color: C.textMuted }}>
+                      client: {ev.client}
+                    </span>
+                  )}
+                  {ev.ip && (
+                    <span style={{ fontSize: "10px", color: C.textMuted }}>
+                      {ev.ip}
+                    </span>
+                  )}
+                  {ev.error && (
+                    <span style={{ fontSize: "10px", color: C.error }}>
+                      error: {ev.error}
+                    </span>
+                  )}
+                </div>
+                {ev.details && Object.keys(ev.details).length > 0 && (
+                  <div style={{ fontSize: "10px", color: C.textMuted }}>
+                    {Object.entries(ev.details).map(([k, v]) =>
+                      <span key={k} style={{ marginRight: "10px" }}>{k}: {v}</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -2916,8 +3295,10 @@ export default function App() {
     { id: "onboard",      label: "Onboard New IDP",    section: "Manage",      adminOnly: true },
     { id: "update",       label: "Update IDP",         section: "Manage",      adminOnly: true },
     { id: "token-setup",  label: "Token Claim Setup",  section: "Admin",       adminOnly: true },
+    { id: "snapshots",   label: "Realm Snapshots",    section: "Admin",       adminOnly: true },
     { id: "usage",        label: "Token Usage",        section: "Observe"      },
     { id: "certificates", label: "Certificates",       section: "Observe"      },
+    { id: "activity",    label: "User Activity",      section: "Observe"      },
     { id: "assistant",    label: "Platform Assistant", section: "Intelligence" },
   ].filter((n) => !n.adminOnly || isAdmin);
 
@@ -2973,6 +3354,8 @@ export default function App() {
             {view === "certificates" && <CertificatesView isAdmin={isAdmin} />}
             {view === "assistant"    && <UnifiedChatView user={user} />}
             {view === "token-setup"  && <TokenSetupView />}
+            {view === "snapshots"    && <RealmSnapshotView />}
+            {view === "activity"     && <UserActivityView />}
           </main>
         </div>
       </div>

@@ -15,3 +15,6 @@ dist/
 # IDE
 .vscode/
 .idea/
+
+# Embedding vector cache (auto-generated, invalidated when docs change)
+backend/.cache/

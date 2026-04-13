@@ -1,6 +1,7 @@
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(usecwd=True))  # Must run before any project module is imported (they read env vars at module level)
 
+import asyncio
 from contextlib import asynccontextmanager
 import logging
 import os
@@ -45,14 +46,18 @@ from tools import (
     core_create_domain_attributes,
     core_get_domain_attributes,
     core_upsert_domain_attributes,
+    delete_realm_snapshot,
     get_chat_sessions,
     get_daily_query_count,
+    get_realm_snapshot,
     get_recent_usage,
     get_session_messages,
     get_usage_by_provider,
     get_usage_summary,
     get_usage_timeline,
+    list_realm_snapshots,
     save_chat_message,
+    save_realm_snapshot,
     scan_all_certificates,
 )
 
@@ -140,7 +145,14 @@ _context_docs_path = os.getenv(
     "PLATFORM_DOCS_PATH",
     str(pathlib.Path(__file__).resolve().parent.parent / "PLATFORM_CONTEXT.md"),
 )
-context_engine = EmbeddingContextEngine(docs_path=_context_docs_path)
+_embedding_cache_path = os.getenv(
+    "EMBEDDING_CACHE_PATH",
+    str(pathlib.Path(__file__).resolve().parent / ".cache" / "embeddings.pkl"),
+)
+context_engine = EmbeddingContextEngine(
+    docs_path=_context_docs_path,
+    cache_path=_embedding_cache_path,
+)
 unified_engine = UnifiedChatEngine(kc_admin, context_engine=context_engine)
 
 
@@ -782,6 +794,110 @@ async def setup_userid_mapper(
         return await kc_admin.ensure_user_id_mapper(realm, client_id, attribute_name, claim_name)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Realm snapshots ────────────────────────────────────────────────────
+
+class SnapshotRequest(BaseModel):
+    label: Optional[str] = None
+
+
+@app.post("/admin/snapshots/{realm}")
+async def take_realm_snapshot(
+    realm: str,
+    body: SnapshotRequest = SnapshotRequest(),
+    user: dict = Depends(require_admin),
+):
+    """Export the realm config via Keycloak partial-export and persist it."""
+    try:
+        snapshot = await kc_admin.export_realm(realm)
+        saved = save_realm_snapshot(realm, body.label, snapshot, user.get("email", "admin"))
+        return saved
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/snapshots/{realm}")
+async def list_snapshots(realm: str, _: dict = Depends(require_admin)):
+    """List all saved snapshots for a realm (newest first, without full JSON)."""
+    return list_realm_snapshots(realm)
+
+
+@app.get("/admin/snapshots/{realm}/{snapshot_id}")
+async def get_snapshot(realm: str, snapshot_id: int, _: dict = Depends(require_admin)):
+    """Retrieve a full snapshot by ID including the realm JSON."""
+    snap = get_realm_snapshot(snapshot_id)
+    if not snap or snap["realm"] != realm:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return snap
+
+
+@app.delete("/admin/snapshots/{realm}/{snapshot_id}")
+async def delete_snapshot_endpoint(
+    realm: str, snapshot_id: int, _: dict = Depends(require_admin)
+):
+    """Delete a realm snapshot."""
+    ok = delete_realm_snapshot(snapshot_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return {"deleted": True}
+
+
+# ── Platform: User activity timeline ─────────────────────────────────────────
+
+@app.get("/platform/users/{user_id}/activity")
+async def get_user_activity(
+    user_id: str,
+    realm: str,
+    days: int = 30,
+    user: dict = Depends(verify_token),
+):
+    """Merge Keycloak user events and admin events into a unified activity timeline."""
+    try:
+        user_events, admin_events = await asyncio.gather(
+            kc_admin.get_user_events(realm, user_id, days=days),
+            kc_admin.get_admin_events_for_user(realm, user_id, days=days),
+            return_exceptions=True,
+        )
+        timeline = []
+        for ev in (user_events if isinstance(user_events, list) else []):
+            timeline.append({
+                "timestamp": ev.get("time"),
+                "type": ev.get("type", "USER_EVENT"),
+                "source": "keycloak",
+                "client": ev.get("clientId"),
+                "ip": ev.get("ipAddress"),
+                "details": ev.get("details", {}),
+                "error": ev.get("error"),
+            })
+        for ev in (admin_events if isinstance(admin_events, list) else []):
+            timeline.append({
+                "timestamp": ev.get("time"),
+                "type": ev.get("operationType", "ADMIN"),
+                "source": "admin",
+                "resource": ev.get("resourceType"),
+                "operation": ev.get("operationType"),
+                "actor": ev.get("authDetails", {}).get("username"),
+                "error": ev.get("error"),
+            })
+        timeline.sort(key=lambda e: e.get("timestamp") or 0, reverse=True)
+        return {"user_id": user_id, "realm": realm, "days": days, "events": timeline}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/platform/users/{user_id}/sessions")
+async def get_user_sessions_endpoint(
+    user_id: str,
+    realm: str,
+    user: dict = Depends(verify_token),
+):
+    """Return currently active Keycloak sessions for a user."""
+    try:
+        sessions = await kc_admin.get_user_sessions(realm, user_id)
+        return {"user_id": user_id, "realm": realm, "sessions": sessions}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
