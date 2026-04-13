@@ -27,7 +27,10 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - ./PLATFORM_CONTEXT.md:/app/PLATFORM_CONTEXT.md:ro
     environment:
+      PLATFORM_DOCS_PATH:      /app/PLATFORM_CONTEXT.md
       OPENAI_API_KEY:        ${OPENAI_API_KEY}
       GEMINI_API_KEY:        ${GEMINI_API_KEY}
       DB_HOST:               postgres

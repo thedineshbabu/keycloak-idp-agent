@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from agent import IDPAgent
 from auth import require_admin, verify_token
 from chat_engine import UnifiedChatEngine
+from embedding_context_engine import EmbeddingContextEngine
 from keycloak_admin import KeycloakAdminClient
 from platform_api import (
     get_active_products,
@@ -106,6 +107,13 @@ async def lifespan(app: FastAPI):
         log.info("Datadog integration enabled (DATADOG_SITE=%s)", os.getenv("DATADOG_SITE", "datadoghq.com"))
     else:
         log.info("Datadog integration disabled (DATADOG_API_KEY/DATADOG_APP_KEY not set)")
+
+    try:
+        await context_engine.initialize()
+        log.info("Platform context engine ready (%d sections)", len(context_engine.sections))
+    except Exception as e:
+        log.warning("Context engine init failed: %s — continuing without RAG", e)
+
     yield
     if _has_scheduler:
         _scheduler.shutdown(wait=False)
@@ -126,7 +134,14 @@ app.add_middleware(
 agent = IDPAgent()
 kc_admin = KeycloakAdminClient()
 policy_engine = PolicyQueryEngine(kc_admin)
-unified_engine = UnifiedChatEngine(kc_admin)
+
+import pathlib
+_context_docs_path = os.getenv(
+    "PLATFORM_DOCS_PATH",
+    str(pathlib.Path(__file__).resolve().parent.parent / "PLATFORM_CONTEXT.md"),
+)
+context_engine = EmbeddingContextEngine(docs_path=_context_docs_path)
+unified_engine = UnifiedChatEngine(kc_admin, context_engine=context_engine)
 
 
 # ── Request models ────────────────────────────────────────────────────────────
